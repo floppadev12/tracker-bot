@@ -478,8 +478,8 @@ def build_project_embed(project: asyncpg.Record, segment_rows: List[asyncpg.Reco
     )
 
     embed.add_field(name="📁 Field", value=project["field_name"], inline=True)
-    embed.add_field(name="‎‎‎ ‎ 🧩 Format", value=project["‎‎format_name"], inline=True)
-    embed.add_field(name="‎ ‎ ‎ ‎ ‎ ‎📌 Status", value=status_map.get(project["status"], project["status"]), inline=True)
+    embed.add_field(name="‎‎‎‎ 🧩 Format", value=project["‎‎format_name"], inline=True)
+    embed.add_field(name="‎ ‎ ‎📌 Status", value=status_map.get(project["status"], project["status"]), inline=True)
 
     embed.add_field(name="⏱️ Hours by Segment", value=hours_text, inline=False)
     embed.add_field(name="🕒 Total Hours", value=format_duration(total_minutes), inline=True)
