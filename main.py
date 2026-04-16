@@ -472,14 +472,20 @@ def build_project_embed(project: asyncpg.Record, segment_rows: List[asyncpg.Reco
         release_date = discord.utils.format_dt(release_dt, style="F")
 
     embed = discord.Embed(
-        title=f"🎮 {project['name']}",
+        title=f"{project['name']}",
         color=EMBED_COLOR,
         timestamp=utcnow(),
     )
 
-    embed.add_field(name="📁Field", value=project["field_name"], inline=True)
-    embed.add_field(name="🧩Format", value=project["‎‎format_name"], inline=True)
-    embed.add_field(name="‎📌Status", value=status_map.get(project["status"], project["status"]), inline=True)
+embed.add_field(
+    name="Details",
+    value=(
+        f"📁 **Field:** {project['field_name']}\n"
+        f"🧩 **Format:** {project['format_name']}\n"
+        f"📌 **Status:** {status_map.get(project['status'], project['status'])}"
+    ),
+    inline=False
+)
 
     embed.add_field(name="⏱️ Hours by Segment", value=hours_text, inline=False)
     embed.add_field(name="🕒 Total Hours", value=format_duration(total_minutes), inline=True)
