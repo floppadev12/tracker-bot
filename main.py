@@ -5,7 +5,6 @@ from typing import Optional, List
 
 import asyncpg
 import discord
-from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
@@ -424,6 +423,11 @@ async def move_project(project_id: int, field_id: int, format_id: int):
         )
 
 
+async def delete_project(project_id: int):
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM projects WHERE id = $1", project_id)
+
+
 async def fetch_winrate_overall():
     async with db_pool.acquire() as conn:
         return await conn.fetchrow(
@@ -642,6 +646,7 @@ def build_edit_embed() -> discord.Embed:
             "• Add/Delete Segments\n"
             "• Rename Projects\n"
             "• Move Projects\n"
+            "• Delete Projects\n"
             "• Change Status\n"
             "• Reopen Released Projects\n"
             "• Set Segment Hours"
@@ -723,7 +728,7 @@ def build_lead_embed(rows: List[asyncpg.Record]) -> discord.Embed:
             prefix = f"{index}. {medal}".strip()
 
             lines.append(
-                f"{prefix} {row['name']} | WR: {format_percent(won, missed)} ✅ | "
+                f"{prefix} **{row['name']} | WR: {format_percent(won, missed)} ✅** | "
                 f"AVG HS: {format_duration_stat(avg_minutes)} 📦"
             )
 
@@ -1185,82 +1190,111 @@ class AddProjectSelect(discord.ui.Select):
                 ephemeral=True,
             )
 
-        segments = await fetch_segments()
-        if not segments:
-            return await interaction.response.send_message("There are no segments configured.", ephemeral=True)
-
-        await interaction.response.send_message(
-            "Choose a segment:",
-            view=await AddSegmentSelectView(project_id).setup(),
-            ephemeral=True,
-        )
+        await interaction.response.send_modal(AddSegmentHoursModal(project_id))
 
 
-class AddSegmentSelectView(discord.ui.View):
+class AddSegmentHoursModal(discord.ui.Modal, title="Add Segment Hours"):
     def __init__(self, project_id: int):
-        super().__init__(timeout=300)
-        self.select = AddSegmentSelect(project_id)
-        self.add_item(self.select)
-
-    async def setup(self):
-        await self.select.refresh_options()
-        return self
-
-
-class AddSegmentSelect(discord.ui.Select):
-    def __init__(self, project_id: int):
-        self.project_id = project_id
-        super().__init__(
-            placeholder="Select a segment...",
-            min_values=1,
-            max_values=1,
-            options=[discord.SelectOption(label="Loading...", value="0")]
-        )
-
-    async def refresh_options(self):
-        rows = await fetch_segments()
-        self.options = [discord.SelectOption(label=r["name"][:100], value=str(r["id"])) for r in rows[:25]]
-
-    async def callback(self, interaction: discord.Interaction):
-        segment_id = int(self.values[0])
-        await interaction.response.send_modal(AddTimeModal(self.project_id, segment_id))
-
-
-class AddTimeModal(discord.ui.Modal, title="Add Time"):
-    def __init__(self, project_id: int, segment_id: int):
         super().__init__()
         self.project_id = project_id
-        self.segment_id = segment_id
 
-        self.duration = discord.ui.TextInput(
-            label="Time Spent",
-            placeholder="Example: 2h 30m",
-            required=True,
+        self.build_time = discord.ui.TextInput(
+            label="Build",
+            placeholder="Example: 2h 30m or leave empty",
+            required=False,
             max_length=20,
         )
-        self.add_item(self.duration)
+        self.script_time = discord.ui.TextInput(
+            label="Script",
+            placeholder="Example: 1h or leave empty",
+            required=False,
+            max_length=20,
+        )
+        self.ui_time = discord.ui.TextInput(
+            label="UI",
+            placeholder="Example: 45m or leave empty",
+            required=False,
+            max_length=20,
+        )
+        self.thumbnail_time = discord.ui.TextInput(
+            label="Thumbnail",
+            placeholder="Example: 30m or leave empty",
+            required=False,
+            max_length=20,
+        )
+
+        self.add_item(self.build_time)
+        self.add_item(self.script_time)
+        self.add_item(self.ui_time)
+        self.add_item(self.thumbnail_time)
 
     async def on_submit(self, interaction: discord.Interaction):
-        minutes = parse_duration(self.duration.value)
-        if minutes is None:
-            return await interaction.response.send_message(
-                "Invalid time format. Use something like `2h 30m`, `2h`, or `30m`.",
-                ephemeral=True,
-            )
-
         project = await fetch_project(self.project_id)
         if not project:
             return await interaction.response.send_message("Project not found.", ephemeral=True)
         if project["status"] != "in_development":
-            return await interaction.response.send_message("This project is no longer in development.", ephemeral=True)
+            return await interaction.response.send_message(
+                "This project is no longer in development.",
+                ephemeral=True,
+            )
 
-        await add_project_minutes(self.project_id, self.segment_id, minutes)
+        segments = await fetch_segments()
+        segment_map = {row["name"].lower(): row["id"] for row in segments}
+
+        inputs = [
+            ("build", self.build_time.value.strip()),
+            ("script", self.script_time.value.strip()),
+            ("ui", self.ui_time.value.strip()),
+            ("thumbnail", self.thumbnail_time.value.strip()),
+        ]
+
+        updates = []
+        total_added = 0
+
+        for segment_name, raw_value in inputs:
+            if not raw_value:
+                continue
+
+            minutes = parse_duration(raw_value)
+            if minutes is None:
+                return await interaction.response.send_message(
+                    f"Invalid time format for **{segment_name.title()}**. Use `2h 30m`, `2h`, or `30m`.",
+                    ephemeral=True,
+                )
+
+            segment_id = segment_map.get(segment_name)
+            if segment_id is None:
+                return await interaction.response.send_message(
+                    f"Segment **{segment_name.title()}** is missing from the database.",
+                    ephemeral=True,
+                )
+
+            updates.append((segment_id, minutes, segment_name.title()))
+            total_added += minutes
+
+        if not updates:
+            return await interaction.response.send_message(
+                "You need to enter at least one segment time.",
+                ephemeral=True,
+            )
+
+        for segment_id, minutes, _segment_name in updates:
+            await add_project_minutes(self.project_id, segment_id, minutes)
 
         updated = await fetch_project(self.project_id)
         rows = await fetch_project_segment_rows(self.project_id)
 
+        summary_lines = [
+            f"**{segment_name}**: +{format_duration(minutes)}"
+            for _segment_id, minutes, segment_name in updates
+        ]
+
         await interaction.response.send_message(
-            content=f"Added **{format_duration(minutes)}** successfully.",
+            content=(
+                "Added time successfully:\n" +
+                "\n".join(summary_lines) +
+                f"\n\n**Total Added:** {format_duration(total_added)}"
+            ),
             embed=build_project_embed(updated, rows),
             view=ProjectActionView(self.project_id, updated["status"]),
             ephemeral=True,
@@ -1570,6 +1604,7 @@ EDIT_ACTIONS = [
     ("Delete Segment", "delete_segment", "🗑️"),
     ("Rename Project", "rename_project", "✏️"),
     ("Move Project", "move_project", "📦"),
+    ("Delete Project", "delete_project", "🗑️"),
     ("Change Project Status", "change_status", "🔁"),
     ("Reopen Project", "reopen_project", "↩️"),
     ("Set Segment Hours", "set_segment_hours", "⏱️"),
@@ -1623,15 +1658,13 @@ class EditMenuSelect(discord.ui.Select):
                 view=await EditFieldView("delete_format").setup(),
                 ephemeral=True,
             )
-        if action == "add_segment":
-            return await interaction.response.send_modal(SimpleNameModal("Add Segment", "Segment Name", "segment"))
         if action == "delete_segment":
             return await interaction.response.send_message(
                 "Choose a segment to delete:",
                 view=await EditSegmentView("delete_segment").setup(),
                 ephemeral=True,
             )
-        if action in {"rename_project", "move_project", "change_status", "reopen_project", "set_segment_hours"}:
+        if action in {"rename_project", "move_project", "delete_project", "change_status", "reopen_project", "set_segment_hours"}:
             return await interaction.response.send_message(
                 "Choose a field first:",
                 view=await EditFieldView(action).setup(),
@@ -1738,7 +1771,7 @@ class EditFieldSelect(discord.ui.Select):
                 ephemeral=True,
             )
 
-        if self.action in {"rename_project", "move_project", "change_status", "reopen_project", "set_segment_hours"}:
+        if self.action in {"rename_project", "move_project", "delete_project", "change_status", "reopen_project", "set_segment_hours"}:
             formats = await fetch_formats(field_id)
             if not formats:
                 return await interaction.response.send_message("This field has no formats.", ephemeral=True)
@@ -1830,6 +1863,13 @@ class EditProjectSelect(discord.ui.Select):
             return await interaction.response.send_message(
                 "Choose the new field:",
                 view=await MoveProjectFieldView(project_id).setup(),
+                ephemeral=True,
+            )
+
+        if self.action == "delete_project":
+            await delete_project(project_id)
+            return await interaction.response.send_message(
+                "Project deleted successfully.",
                 ephemeral=True,
             )
 
