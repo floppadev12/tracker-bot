@@ -651,7 +651,7 @@ class ProjectHomeView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=300)
 
-    @discord.ui.button(label="Create New Project", emoji="🆕", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Create New Project", emoji="📥", style=discord.ButtonStyle.secondary)
     async def create_project_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         fields = await fetch_fields()
         if not fields:
@@ -1612,7 +1612,7 @@ class ChangeStatusSelect(discord.ui.Select):
             discord.SelectOption(label="In Development", value="in_development", emoji="🛠️"),
             discord.SelectOption(label="Released", value="released", emoji="🚀"),
             discord.SelectOption(label="Won", value="won", emoji="🏆"),
-            discord.SelectOption(label="Missed", value="missed", emoji="❌"),
+            discord.SelectOption(label="Missed", value="missed", emoji="🗑️"),
         ]
         super().__init__(
             placeholder="Select the new status...",
