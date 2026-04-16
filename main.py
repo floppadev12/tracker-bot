@@ -461,6 +461,8 @@ def build_home_embed() -> discord.Embed:
         inline=False,
     return embed
 
+    )
+
 
 def build_project_embed(project: asyncpg.Record, segment_rows: List[asyncpg.Record]) -> discord.Embed:
     status_map = {
@@ -528,7 +530,6 @@ def build_winrate_embed(title: str, won: int, missed: int) -> discord.Embed:
     embed.add_field(name="❌ Missed", value=str(missed), inline=True)
     embed.add_field(name="📦 Counted", value=str(total), inline=True)
     embed.add_field(name="📊 Winrate", value=f"**{winrate:.1f}%**", inline=False)
-    embed.set_footer(text="Released and In Development projects are not counted")
     return embed
 
 
