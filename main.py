@@ -735,7 +735,7 @@ def build_lead_embed(rows: List[asyncpg.Record]) -> discord.Embed:
         description = "\n".join(lines)
 
     embed = discord.Embed(
-        title="🏆 Field Leaderboard",
+        title="Field Leaderboard",
         description=description,
         color=EMBED_COLOR,
         timestamp=utcnow(),
