@@ -442,10 +442,9 @@ async def fetch_winrate_by_format(format_id: int):
 # -----------------------------
 def build_home_embed() -> discord.Embed:
     embed = discord.Embed(
-        title="🎮 Project Manager",
+        title="Project Assistant",
         description=(
-            "Manage your Roblox game projects from one place.\n\n"
-            "Use the buttons below to create a new project or track an existing one."
+            "Hi, I’m **Nova**! How can I help with your **projects** today?👋"
         ),
         color=EMBED_COLOR,
         timestamp=utcnow(),
@@ -460,13 +459,6 @@ def build_home_embed() -> discord.Embed:
         name="📂 Track Project",
         value="Open a project panel to view its status, time spent, release state, and closing buttons.",
         inline=False,
-    )
-    embed.add_field(
-        name="💡 Reminder",
-        value="All responses are shown only to you.",
-        inline=False,
-    )
-    embed.set_footer(text="Roblox Project Tracker")
     return embed
 
 
@@ -492,7 +484,7 @@ def build_project_embed(project: asyncpg.Record, segment_rows: List[asyncpg.Reco
         release_date = discord.utils.format_dt(release_dt, style="F")
 
     embed = discord.Embed(
-        title=f"🎮 {project['name']}",
+        title=f"{project['name']}",
         description=(
             "Here is the current project overview.\n\n"
             "Projects in development can still receive hours. "
