@@ -442,11 +442,31 @@ async def fetch_winrate_by_format(format_id: int):
 # -----------------------------
 def build_home_embed() -> discord.Embed:
     embed = discord.Embed(
-        title="Project Assistant",
-        description="Hi, I’m **Nova**! How can I help with your **projects** today? 👋",
+        title="🎮 Project Manager",
+        description=(
+            "Manage your Roblox game projects from one place.\n\n"
+            "Use the buttons below to create a new project or track an existing one."
+        ),
         color=EMBED_COLOR,
         timestamp=utcnow(),
     )
+
+    embed.add_field(
+        name="🆕 Create New Project",
+        value="Create a project and automatically start it in **In Development** status.",
+        inline=False,
+    )
+    embed.add_field(
+        name="📂 Track Project",
+        value="Open a project panel to view its status, time spent, release state, and closing buttons.",
+        inline=False,
+    )
+    embed.add_field(
+        name="💡 Reminder",
+        value="All responses are shown only to you.",
+        inline=False,
+    )
+    embed.set_footer(text="Roblox Project Tracker")
     return embed
 
 
@@ -459,6 +479,10 @@ def build_project_embed(project: asyncpg.Record, segment_rows: List[asyncpg.Reco
     }
 
     total_minutes = sum(int(row["minutes"]) for row in segment_rows)
+    hours_text = "\n".join(
+        f"**{row['segment_name']}** — {format_duration(int(row['minutes']))}"
+        for row in segment_rows
+    ) or "No hours added yet."
 
     release_date = "Not released yet"
     if project["released_at"]:
@@ -469,6 +493,11 @@ def build_project_embed(project: asyncpg.Record, segment_rows: List[asyncpg.Reco
 
     embed = discord.Embed(
         title=f"🎮 {project['name']}",
+        description=(
+            "Here is the current project overview.\n\n"
+            "Projects in development can still receive hours. "
+            "Released projects are locked and can be marked as **Won** or **Missed**."
+        ),
         color=EMBED_COLOR,
         timestamp=utcnow(),
     )
@@ -477,38 +506,37 @@ def build_project_embed(project: asyncpg.Record, segment_rows: List[asyncpg.Reco
     embed.add_field(name="🧩 Format", value=project["format_name"], inline=True)
     embed.add_field(name="📌 Status", value=status_map.get(project["status"], project["status"]), inline=True)
 
-    left_segments = []
-    right_segments = []
-
-    for index, row in enumerate(segment_rows):
-        line = f"**{row['segment_name']}** — {format_duration(int(row['minutes']))}"
-        if index % 2 == 0:
-            left_segments.append(line)
-        else:
-            right_segments.append(line)
-
-    embed.add_field(
-        name="⏱️ Hours",
-        value="\n".join(left_segments) if left_segments else "No hours added yet.",
-        inline=True,
-    )
-
-    embed.add_field(
-        name="\u200b",
-        value="\n".join(right_segments) if right_segments else "\u200b",
-        inline=True,
-    )
-
-    embed.add_field(
-        name="\u200b",
-        value="\u200b",
-        inline=True,
-    )
-
+    embed.add_field(name="⏱️ Hours by Segment", value=hours_text, inline=False)
     embed.add_field(name="🕒 Total Hours", value=format_duration(total_minutes), inline=True)
     embed.add_field(name="📅 Release Date", value=release_date, inline=True)
-    embed.add_field(name="\u200b", value="\u200b", inline=True)
 
+    if project["status"] == "in_development":
+        summary = "This project is still active. You can add more hours and release it when ready."
+    elif project["status"] == "released":
+        summary = "This project is released. Time adding is locked. You can now close it as Won or Missed."
+    else:
+        summary = "This project is closed. There are no more action buttons on closed projects."
+
+    embed.add_field(name="📊 Summary", value=summary, inline=False)
+    embed.set_footer(text="Roblox Project Tracker")
+    return embed
+
+
+def build_winrate_embed(title: str, won: int, missed: int) -> discord.Embed:
+    total = won + missed
+    winrate = (won / total * 100) if total > 0 else 0.0
+
+    embed = discord.Embed(
+        title=f"📈 {title}",
+        description="Winrate is calculated only from projects marked as **Won** or **Missed**.",
+        color=EMBED_COLOR,
+        timestamp=utcnow(),
+    )
+    embed.add_field(name="🏆 Won", value=str(won), inline=True)
+    embed.add_field(name="❌ Missed", value=str(missed), inline=True)
+    embed.add_field(name="📦 Counted", value=str(total), inline=True)
+    embed.add_field(name="📊 Winrate", value=f"**{winrate:.1f}%**", inline=False)
+    embed.set_footer(text="Released and In Development projects are not counted")
     return embed
 
 
@@ -536,6 +564,7 @@ def build_edit_embed() -> discord.Embed:
         ),
         inline=False,
     )
+    embed.set_footer(text="Restricted to the edit role")
     return embed
 
 
@@ -658,7 +687,7 @@ class ProjectHomeView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=300)
 
-    @discord.ui.button(label="Create New Project", emoji="🆕", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Create New Project", emoji="🆕", style=discord.ButtonStyle.primary)
     async def create_project_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         fields = await fetch_fields()
         if not fields:
@@ -1767,6 +1796,7 @@ async def winrate_command(interaction: discord.Interaction):
         timestamp=utcnow(),
     )
     embed.add_field(name="Options", value="Overall, By Field, or By Format", inline=False)
+    embed.set_footer(text="Only Won and Missed projects are counted")
 
     await interaction.response.send_message(
         embed=embed,
