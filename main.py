@@ -63,6 +63,20 @@ def format_duration(total_minutes: int) -> str:
     return f"{minutes}m"
 
 
+def format_duration_stat(total_minutes: int) -> str:
+    total_minutes = max(0, int(total_minutes))
+    hours = total_minutes // 60
+    minutes = total_minutes % 60
+    return f"{hours}h {minutes:02d}m"
+
+
+def format_percent(won: int, missed: int) -> str:
+    total = won + missed
+    if total <= 0:
+        return "0%"
+    return f"{round((won / total) * 100)}%"
+
+
 def has_maintenance_role(interaction: discord.Interaction) -> bool:
     if not interaction.guild or not isinstance(interaction.user, discord.Member):
         return False
@@ -135,11 +149,27 @@ async def fetch_fields() -> List[asyncpg.Record]:
         return await conn.fetch("SELECT id, name FROM fields ORDER BY name ASC")
 
 
+async def fetch_field(field_id: int) -> Optional[asyncpg.Record]:
+    async with db_pool.acquire() as conn:
+        return await conn.fetchrow(
+            "SELECT id, name FROM fields WHERE id = $1",
+            field_id,
+        )
+
+
 async def fetch_formats(field_id: int) -> List[asyncpg.Record]:
     async with db_pool.acquire() as conn:
         return await conn.fetch(
             "SELECT id, name FROM formats WHERE field_id = $1 ORDER BY name ASC",
             field_id,
+        )
+
+
+async def fetch_format(format_id: int) -> Optional[asyncpg.Record]:
+    async with db_pool.acquire() as conn:
+        return await conn.fetchrow(
+            "SELECT id, field_id, name FROM formats WHERE id = $1",
+            format_id,
         )
 
 
@@ -437,6 +467,95 @@ async def fetch_winrate_by_format(format_id: int):
         )
 
 
+async def fetch_won_project_totals_by_format(format_id: int) -> List[asyncpg.Record]:
+    async with db_pool.acquire() as conn:
+        return await conn.fetch(
+            """
+            SELECT
+                p.id,
+                p.name,
+                COALESCE(SUM(psh.minutes), 0) AS total_minutes
+            FROM projects p
+            LEFT JOIN project_segment_hours psh
+                ON psh.project_id = p.id
+            WHERE p.format_id = $1
+              AND p.status = 'won'
+            GROUP BY p.id, p.name
+            ORDER BY total_minutes DESC, p.name ASC
+            """,
+            format_id,
+        )
+
+
+async def fetch_won_format_totals_by_field(field_id: int) -> List[asyncpg.Record]:
+    async with db_pool.acquire() as conn:
+        return await conn.fetch(
+            """
+            SELECT
+                fm.id,
+                fm.name,
+                COALESCE(SUM(psh.minutes), 0) AS total_minutes
+            FROM formats fm
+            LEFT JOIN projects p
+                ON p.format_id = fm.id
+               AND p.status = 'won'
+            LEFT JOIN project_segment_hours psh
+                ON psh.project_id = p.id
+            WHERE fm.field_id = $1
+            GROUP BY fm.id, fm.name
+            HAVING COUNT(p.id) > 0
+            ORDER BY total_minutes DESC, fm.name ASC
+            """,
+            field_id,
+        )
+
+
+async def fetch_field_leaderboard_rows() -> List[asyncpg.Record]:
+    async with db_pool.acquire() as conn:
+        return await conn.fetch(
+            """
+            WITH project_totals AS (
+                SELECT
+                    p.id AS project_id,
+                    p.field_id,
+                    p.status,
+                    COALESCE(SUM(psh.minutes), 0) AS total_minutes
+                FROM projects p
+                LEFT JOIN project_segment_hours psh
+                    ON psh.project_id = p.id
+                WHERE p.status IN ('won', 'missed')
+                GROUP BY p.id, p.field_id, p.status
+            )
+            SELECT
+                f.id,
+                f.name,
+                COUNT(*) FILTER (WHERE pt.status = 'won') AS won,
+                COUNT(*) FILTER (WHERE pt.status = 'missed') AS missed,
+                COUNT(pt.project_id) AS finished_count,
+                COALESCE(SUM(pt.total_minutes), 0) AS total_minutes_finished,
+                CASE
+                    WHEN COUNT(pt.project_id) > 0
+                    THEN COALESCE(SUM(pt.total_minutes), 0)::FLOAT / COUNT(pt.project_id)
+                    ELSE 0
+                END AS avg_minutes
+            FROM fields f
+            LEFT JOIN project_totals pt
+                ON pt.field_id = f.id
+            GROUP BY f.id, f.name
+            HAVING COUNT(pt.project_id) > 0
+            ORDER BY
+                (COUNT(*) FILTER (WHERE pt.status = 'won'))::FLOAT / NULLIF(COUNT(pt.project_id), 0) DESC,
+                CASE
+                    WHEN COUNT(pt.project_id) > 0
+                    THEN COALESCE(SUM(pt.total_minutes), 0)::FLOAT / COUNT(pt.project_id)
+                    ELSE 0
+                END ASC,
+                COUNT(pt.project_id) DESC,
+                f.name ASC
+            """
+        )
+
+
 # -----------------------------
 # Embed builders
 # -----------------------------
@@ -528,6 +647,93 @@ def build_edit_embed() -> discord.Embed:
             "• Set Segment Hours"
         ),
         inline=False,
+    )
+    return embed
+
+
+def build_summary_menu_embed() -> discord.Embed:
+    embed = discord.Embed(
+        title="📊 Summary Panel",
+        description="Choose whether you want a **Field** summary or a **Format** summary.",
+        color=EMBED_COLOR,
+        timestamp=utcnow(),
+    )
+    return embed
+
+
+def build_format_summary_embed(format_name: str, project_rows: List[asyncpg.Record], won: int, missed: int) -> discord.Embed:
+    if not project_rows:
+        description = "No won projects yet."
+    else:
+        lines = [
+            f"**{index}. {row['name']}** — {format_duration_stat(int(row['total_minutes'] or 0))}"
+            for index, row in enumerate(project_rows, start=1)
+        ]
+        description = "\n".join(lines)
+
+    description += f"\n\n**WR:** {format_percent(won, missed)} ✅"
+
+    embed = discord.Embed(
+        title=f"📦 Format Summary — {format_name}",
+        description=description,
+        color=EMBED_COLOR,
+        timestamp=utcnow(),
+    )
+    return embed
+
+
+def build_field_summary_embed(field_name: str, format_rows: List[asyncpg.Record], won: int, missed: int) -> discord.Embed:
+    if not format_rows:
+        description = "No won projects yet."
+    else:
+        lines = [
+            f"**{index}. {row['name']}** — {format_duration_stat(int(row['total_minutes'] or 0))}"
+            for index, row in enumerate(format_rows, start=1)
+        ]
+        description = "\n".join(lines)
+
+    description += f"\n\n**WR:** {format_percent(won, missed)} ✅"
+
+    embed = discord.Embed(
+        title=f"📁 Field Summary — {field_name}",
+        description=description,
+        color=EMBED_COLOR,
+        timestamp=utcnow(),
+    )
+    return embed
+
+
+def build_lead_embed(rows: List[asyncpg.Record]) -> discord.Embed:
+    if not rows:
+        description = "No finished projects yet."
+    else:
+        medal_map = {
+            1: "🏅",
+            2: "🥈",
+            3: "🥉",
+        }
+
+        lines = []
+        for index, row in enumerate(rows, start=1):
+            won = int(row["won"] or 0)
+            missed = int(row["missed"] or 0)
+            avg_minutes = int(round(float(row["avg_minutes"] or 0)))
+
+            medal = medal_map.get(index, "")
+            prefix = f"{index}. {medal}".strip()
+
+            lines.append(
+                f"{prefix} {row['name']} | WR: {format_percent(won, missed)} ✅ | "
+                f"AVG HS: {format_duration_stat(avg_minutes)} 📦"
+            )
+
+        description = "\n".join(lines)
+
+    embed = discord.Embed(
+        title="🏆 Field Leaderboard",
+        description=description,
+        color=EMBED_COLOR,
+        timestamp=utcnow(),
     )
     return embed
 
@@ -1062,6 +1268,152 @@ class AddTimeModal(discord.ui.Modal, title="Add Time"):
 
 
 # -----------------------------
+# /summary flow
+# -----------------------------
+class SummaryMenuView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    @discord.ui.button(label="Field", emoji="📁", style=discord.ButtonStyle.secondary)
+    async def field_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        fields = await fetch_fields()
+        if not fields:
+            return await interaction.response.send_message(
+                "There are no fields yet.",
+                ephemeral=True,
+            )
+
+        await interaction.response.send_message(
+            "Choose a field:",
+            view=await SummaryFieldSelectView(mode="field").setup(),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Format", emoji="📦", style=discord.ButtonStyle.secondary)
+    async def format_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        fields = await fetch_fields()
+        if not fields:
+            return await interaction.response.send_message(
+                "There are no fields yet.",
+                ephemeral=True,
+            )
+
+        await interaction.response.send_message(
+            "Choose a field first:",
+            view=await SummaryFieldSelectView(mode="format").setup(),
+            ephemeral=True,
+        )
+
+
+class SummaryFieldSelectView(discord.ui.View):
+    def __init__(self, mode: str):
+        super().__init__(timeout=300)
+        self.select = SummaryFieldSelect(mode)
+        self.add_item(self.select)
+
+    async def setup(self):
+        await self.select.refresh_options()
+        return self
+
+
+class SummaryFieldSelect(discord.ui.Select):
+    def __init__(self, mode: str):
+        self.mode = mode
+        super().__init__(
+            placeholder="Select a field...",
+            min_values=1,
+            max_values=1,
+            options=[discord.SelectOption(label="Loading...", value="0")],
+        )
+
+    async def refresh_options(self):
+        rows = await fetch_fields()
+        self.options = [
+            discord.SelectOption(label=row["name"][:100], value=str(row["id"]))
+            for row in rows[:25]
+        ]
+
+    async def callback(self, interaction: discord.Interaction):
+        field_id = int(self.values[0])
+
+        if self.mode == "field":
+            field = await fetch_field(field_id)
+            if not field:
+                return await interaction.response.send_message("Field not found.", ephemeral=True)
+
+            format_rows = await fetch_won_format_totals_by_field(field_id)
+            winrate_row = await fetch_winrate_by_field(field_id)
+
+            won = int(winrate_row["won"] or 0)
+            missed = int(winrate_row["missed"] or 0)
+
+            return await interaction.response.send_message(
+                embed=build_field_summary_embed(field["name"], format_rows, won, missed),
+                ephemeral=True,
+            )
+
+        formats = await fetch_formats(field_id)
+        if not formats:
+            return await interaction.response.send_message(
+                "This field has no formats.",
+                ephemeral=True,
+            )
+
+        await interaction.response.send_message(
+            "Choose a format:",
+            view=await SummaryFormatSelectView(field_id).setup(),
+            ephemeral=True,
+        )
+
+
+class SummaryFormatSelectView(discord.ui.View):
+    def __init__(self, field_id: int):
+        super().__init__(timeout=300)
+        self.select = SummaryFormatSelect(field_id)
+        self.add_item(self.select)
+
+    async def setup(self):
+        await self.select.refresh_options()
+        return self
+
+
+class SummaryFormatSelect(discord.ui.Select):
+    def __init__(self, field_id: int):
+        self.field_id = field_id
+        super().__init__(
+            placeholder="Select a format...",
+            min_values=1,
+            max_values=1,
+            options=[discord.SelectOption(label="Loading...", value="0")],
+        )
+
+    async def refresh_options(self):
+        rows = await fetch_formats(self.field_id)
+        self.options = [
+            discord.SelectOption(label=row["name"][:100], value=str(row["id"]))
+            for row in rows[:25]
+        ]
+
+    async def callback(self, interaction: discord.Interaction):
+        format_id = int(self.values[0])
+
+        format_row = await fetch_format(format_id)
+        if not format_row:
+            return await interaction.response.send_message("Format not found.", ephemeral=True)
+
+        project_rows = await fetch_won_project_totals_by_format(format_id)
+        winrate_row = await fetch_winrate_by_format(format_id)
+
+        won = int(winrate_row["won"] or 0)
+        missed = int(winrate_row["missed"] or 0)
+
+        await interaction.response.send_message(
+            embed=build_format_summary_embed(format_row["name"], project_rows, won, missed),
+            ephemeral=True,
+        )
+
+
+# -----------------------------
 # /winrate flow
 # -----------------------------
 class WinrateMenuView(discord.ui.View):
@@ -1271,6 +1623,8 @@ class EditMenuSelect(discord.ui.Select):
                 view=await EditFieldView("delete_format").setup(),
                 ephemeral=True,
             )
+        if action == "add_segment":
+            return await interaction.response.send_modal(SimpleNameModal("Add Segment", "Segment Name", "segment"))
         if action == "delete_segment":
             return await interaction.response.send_message(
                 "Choose a segment to delete:",
@@ -1747,6 +2101,24 @@ async def add_command(interaction: discord.Interaction):
     await interaction.response.send_message(
         "Choose a field:",
         view=await AddFieldSelectView().setup(),
+        ephemeral=True,
+    )
+
+
+@tree.command(name="summary", description="Show project summaries", guild=discord.Object(id=GUILD_ID))
+async def summary_command(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        embed=build_summary_menu_embed(),
+        view=SummaryMenuView(),
+        ephemeral=True,
+    )
+
+
+@tree.command(name="lead", description="Show the field leaderboard", guild=discord.Object(id=GUILD_ID))
+async def lead_command(interaction: discord.Interaction):
+    rows = await fetch_field_leaderboard_rows()
+    await interaction.response.send_message(
+        embed=build_lead_embed(rows),
         ephemeral=True,
     )
 
