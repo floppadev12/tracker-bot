@@ -455,7 +455,7 @@ def build_project_embed(project: asyncpg.Record, segment_rows: List[asyncpg.Reco
         "in_development": "🛠️ In Development",
         "released": "🚀 Released",
         "won": "🏆 Won",
-        "missed": "❌ Missed",
+        "missed": "🗑️ Missed",
     }
 
     total_minutes = sum(int(row["minutes"]) for row in segment_rows)
@@ -499,7 +499,7 @@ def build_winrate_embed(title: str, won: int, missed: int) -> discord.Embed:
         timestamp=utcnow(),
     )
     embed.add_field(name="🏆 Won", value=str(won), inline=True)
-    embed.add_field(name="❌ Missed", value=str(missed), inline=True)
+    embed.add_field(name="🗑️ Missed", value=str(missed), inline=True)
     embed.add_field(name="📦 Counted", value=str(total), inline=True)
     embed.add_field(name="📊 Winrate", value=f"**{winrate:.1f}%**", inline=False)
     return embed
@@ -579,7 +579,7 @@ class WonButton(discord.ui.Button):
 
 class MissedButton(discord.ui.Button):
     def __init__(self, project_id: int):
-        super().__init__(label="Missed", emoji="❌", style=discord.ButtonStyle.danger)
+        super().__init__(label="Missed", emoji="🗑️", style=discord.ButtonStyle.danger)
         self.project_id = project_id
 
     async def callback(self, interaction: discord.Interaction):
