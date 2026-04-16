@@ -5,6 +5,7 @@ from typing import Optional, List
 
 import asyncpg
 import discord
+from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
@@ -441,19 +442,40 @@ async def fetch_winrate_by_format(format_id: int):
 # -----------------------------
 def build_home_embed() -> discord.Embed:
     embed = discord.Embed(
-        title="Project Assistant",
-        description="Hi, I’m **Nova**! How can I help with your **projects** today?👋",
+        title="🎮 Project Manager",
+        description=(
+            "Manage your Roblox game projects from one place.\n\n"
+            "Use the buttons below to create a new project or track an existing one."
+        ),
         color=EMBED_COLOR,
+        timestamp=utcnow(),
     )
+
+    embed.add_field(
+        name="🆕 Create New Project",
+        value="Create a project and automatically start it in **In Development** status.",
+        inline=False,
+    )
+    embed.add_field(
+        name="📂 Track Project",
+        value="Open a project panel to view its status, time spent, release state, and closing buttons.",
+        inline=False,
+    )
+    embed.add_field(
+        name="💡 Reminder",
+        value="All responses are shown only to you.",
+        inline=False,
+    )
+    embed.set_footer(text="Roblox Project Tracker")
     return embed
 
 
 def build_project_embed(project: asyncpg.Record, segment_rows: List[asyncpg.Record]) -> discord.Embed:
     status_map = {
-        "in_development": "In Development",
-        "released": "Released",
-        "won": "Won",
-        "missed": "Missed",
+        "in_development": "🛠️ In Development",
+        "released": "🚀 Released",
+        "won": "🏆 Won",
+        "missed": "❌ Missed",
     }
 
     total_minutes = sum(int(row["minutes"]) for row in segment_rows)
@@ -470,18 +492,33 @@ def build_project_embed(project: asyncpg.Record, segment_rows: List[asyncpg.Reco
         release_date = discord.utils.format_dt(release_dt, style="F")
 
     embed = discord.Embed(
-        title=project["name"],
-        description="Here is the current project overview.",
+        title=f"🎮 {project['name']}",
+        description=(
+            "Here is the current project overview.\n\n"
+            "Projects in development can still receive hours. "
+            "Released projects are locked and can be marked as **Won** or **Missed**."
+        ),
         color=EMBED_COLOR,
+        timestamp=utcnow(),
     )
 
-    embed.add_field(name="Field", value=project["field_name"], inline=True)
-    embed.add_field(name="Format", value=project["format_name"], inline=True)
-    embed.add_field(name="Status", value=status_map.get(project["status"], project["status"]), inline=True)
-    embed.add_field(name="Hours by Segment", value=hours_text, inline=False)
-    embed.add_field(name="Total Hours", value=format_duration(total_minutes), inline=True)
-    embed.add_field(name="Release Date", value=release_date, inline=True)
+    embed.add_field(name="📁 Field", value=project["field_name"], inline=True)
+    embed.add_field(name="🧩 Format", value=project["format_name"], inline=True)
+    embed.add_field(name="📌 Status", value=status_map.get(project["status"], project["status"]), inline=True)
 
+    embed.add_field(name="⏱️ Hours by Segment", value=hours_text, inline=False)
+    embed.add_field(name="🕒 Total Hours", value=format_duration(total_minutes), inline=True)
+    embed.add_field(name="📅 Release Date", value=release_date, inline=True)
+
+    if project["status"] == "in_development":
+        summary = "This project is still active. You can add more hours and release it when ready."
+    elif project["status"] == "released":
+        summary = "This project is released. Time adding is locked. You can now close it as Won or Missed."
+    else:
+        summary = "This project is closed. There are no more action buttons on closed projects."
+
+    embed.add_field(name="📊 Summary", value=summary, inline=False)
+    embed.set_footer(text="Roblox Project Tracker")
     return embed
 
 
@@ -490,21 +527,28 @@ def build_winrate_embed(title: str, won: int, missed: int) -> discord.Embed:
     winrate = (won / total * 100) if total > 0 else 0.0
 
     embed = discord.Embed(
-        title=title,
+        title=f"📈 {title}",
+        description="Winrate is calculated only from projects marked as **Won** or **Missed**.",
         color=EMBED_COLOR,
+        timestamp=utcnow(),
     )
-    embed.add_field(name="Won", value=str(won), inline=True)
-    embed.add_field(name="Missed", value=str(missed), inline=True)
-    embed.add_field(name="Counted", value=str(total), inline=True)
-    embed.add_field(name="Winrate", value=f"**{winrate:.1f}%**", inline=False)
+    embed.add_field(name="🏆 Won", value=str(won), inline=True)
+    embed.add_field(name="❌ Missed", value=str(missed), inline=True)
+    embed.add_field(name="📦 Counted", value=str(total), inline=True)
+    embed.add_field(name="📊 Winrate", value=f"**{winrate:.1f}%**", inline=False)
+    embed.set_footer(text="Released and In Development projects are not counted")
     return embed
 
 
 def build_edit_embed() -> discord.Embed:
     embed = discord.Embed(
-        title="Edit Panel",
-        description="Choose an action from the menu below.",
+        title="🛠️ Edit Panel",
+        description=(
+            "Manage fields, formats, segments, and project corrections.\n\n"
+            "Choose an action from the menu below."
+        ),
         color=EMBED_COLOR,
+        timestamp=utcnow(),
     )
     embed.add_field(
         name="Actions",
@@ -520,6 +564,7 @@ def build_edit_embed() -> discord.Embed:
         ),
         inline=False,
     )
+    embed.set_footer(text="Restricted to the edit role")
     return embed
 
 
@@ -540,7 +585,7 @@ class ProjectActionView(discord.ui.View):
 
 class ReleaseButton(discord.ui.Button):
     def __init__(self, project_id: int):
-        super().__init__(label="Release", style=discord.ButtonStyle.secondary)
+        super().__init__(label="Release", emoji="🚀", style=discord.ButtonStyle.primary)
         self.project_id = project_id
 
     async def callback(self, interaction: discord.Interaction):
@@ -555,7 +600,7 @@ class ReleaseButton(discord.ui.Button):
 
 class WonButton(discord.ui.Button):
     def __init__(self, project_id: int):
-        super().__init__(label="Won", style=discord.ButtonStyle.success)
+        super().__init__(label="Won", emoji="🏆", style=discord.ButtonStyle.success)
         self.project_id = project_id
 
     async def callback(self, interaction: discord.Interaction):
@@ -570,7 +615,7 @@ class WonButton(discord.ui.Button):
 
 class MissedButton(discord.ui.Button):
     def __init__(self, project_id: int):
-        super().__init__(label="Missed", style=discord.ButtonStyle.danger)
+        super().__init__(label="Missed", emoji="❌", style=discord.ButtonStyle.danger)
         self.project_id = project_id
 
     async def callback(self, interaction: discord.Interaction):
@@ -642,7 +687,7 @@ class ProjectHomeView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=300)
 
-    @discord.ui.button(label="Create New Project", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Create New Project", emoji="🆕", style=discord.ButtonStyle.primary)
     async def create_project_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         fields = await fetch_fields()
         if not fields:
@@ -657,7 +702,7 @@ class ProjectHomeView(discord.ui.View):
             ephemeral=True,
         )
 
-    @discord.ui.button(label="Track Project", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Track Project", emoji="📂", style=discord.ButtonStyle.secondary)
     async def track_project_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         fields = await fetch_fields()
         if not fields:
@@ -966,7 +1011,7 @@ class AddProjectSelect(discord.ui.Select):
             return await interaction.response.send_message("Project not found.", ephemeral=True)
         if project["status"] != "in_development":
             return await interaction.response.send_message(
-                "You can only add hours to projects that are In Development.",
+                "You can only add hours to projects that are **In Development**.",
                 ephemeral=True,
             )
 
@@ -1064,9 +1109,9 @@ class WinrateMenuView(discord.ui.View):
 class WinrateMenuSelect(discord.ui.Select):
     def __init__(self):
         options = [
-            discord.SelectOption(label="Overall", value="overall"),
-            discord.SelectOption(label="By Field", value="field"),
-            discord.SelectOption(label="By Format", value="format"),
+            discord.SelectOption(label="Overall", value="overall", emoji="📈"),
+            discord.SelectOption(label="By Field", value="field", emoji="📁"),
+            discord.SelectOption(label="By Format", value="format", emoji="🧩"),
         ]
         super().__init__(
             placeholder="Choose winrate type...",
@@ -1083,7 +1128,7 @@ class WinrateMenuSelect(discord.ui.Select):
             won = int(row["won"] or 0)
             missed = int(row["missed"] or 0)
             return await interaction.response.send_message(
-                embed=build_winrate_embed("Winrate", won, missed),
+                embed=build_winrate_embed("Overall Winrate", won, missed),
                 ephemeral=True,
             )
 
@@ -1142,7 +1187,7 @@ class WinrateFieldSelect(discord.ui.Select):
             field_name = next((f["name"] for f in fields if f["id"] == field_id), "Field")
 
             return await interaction.response.send_message(
-                embed=build_winrate_embed(field_name, won, missed),
+                embed=build_winrate_embed(f"Winrate — {field_name}", won, missed),
                 ephemeral=True,
             )
 
@@ -1192,7 +1237,7 @@ class WinrateFormatSelect(discord.ui.Select):
         format_name = next((f["name"] for f in formats if f["id"] == format_id), "Format")
 
         await interaction.response.send_message(
-            embed=build_winrate_embed(format_name, won, missed),
+            embed=build_winrate_embed(f"Winrate — {format_name}", won, missed),
             ephemeral=True,
         )
 
@@ -1201,17 +1246,17 @@ class WinrateFormatSelect(discord.ui.Select):
 # /edit flow
 # -----------------------------
 EDIT_ACTIONS = [
-    ("Add Field", "add_field"),
-    ("Delete Field", "delete_field"),
-    ("Add Format", "add_format"),
-    ("Delete Format", "delete_format"),
-    ("Add Segment", "add_segment"),
-    ("Delete Segment", "delete_segment"),
-    ("Rename Project", "rename_project"),
-    ("Move Project", "move_project"),
-    ("Change Project Status", "change_status"),
-    ("Reopen Project", "reopen_project"),
-    ("Set Segment Hours", "set_segment_hours"),
+    ("Add Field", "add_field", "➕"),
+    ("Delete Field", "delete_field", "🗑️"),
+    ("Add Format", "add_format", "➕"),
+    ("Delete Format", "delete_format", "🗑️"),
+    ("Add Segment", "add_segment", "➕"),
+    ("Delete Segment", "delete_segment", "🗑️"),
+    ("Rename Project", "rename_project", "✏️"),
+    ("Move Project", "move_project", "📦"),
+    ("Change Project Status", "change_status", "🔁"),
+    ("Reopen Project", "reopen_project", "↩️"),
+    ("Set Segment Hours", "set_segment_hours", "⏱️"),
 ]
 
 
@@ -1224,8 +1269,8 @@ class EditMenuView(discord.ui.View):
 class EditMenuSelect(discord.ui.Select):
     def __init__(self):
         options = [
-            discord.SelectOption(label=label, value=value)
-            for label, value in EDIT_ACTIONS
+            discord.SelectOption(label=label, value=value, emoji=emoji)
+            for label, value, emoji in EDIT_ACTIONS
         ]
         super().__init__(
             placeholder="Choose an edit action...",
@@ -1600,10 +1645,10 @@ class ChangeStatusSelect(discord.ui.Select):
     def __init__(self, project_id: int):
         self.project_id = project_id
         options = [
-            discord.SelectOption(label="In Development", value="in_development"),
-            discord.SelectOption(label="Released", value="released"),
-            discord.SelectOption(label="Won", value="won"),
-            discord.SelectOption(label="Missed", value="missed"),
+            discord.SelectOption(label="In Development", value="in_development", emoji="🛠️"),
+            discord.SelectOption(label="Released", value="released", emoji="🚀"),
+            discord.SelectOption(label="Won", value="won", emoji="🏆"),
+            discord.SelectOption(label="Missed", value="missed", emoji="❌"),
         ]
         super().__init__(
             placeholder="Select the new status...",
@@ -1745,11 +1790,13 @@ async def add_command(interaction: discord.Interaction):
 @tree.command(name="winrate", description="Show project winrate", guild=discord.Object(id=GUILD_ID))
 async def winrate_command(interaction: discord.Interaction):
     embed = discord.Embed(
-        title="Winrate Panel",
+        title="📈 Winrate Panel",
         description="Choose how you want to calculate the winrate.",
         color=EMBED_COLOR,
+        timestamp=utcnow(),
     )
     embed.add_field(name="Options", value="Overall, By Field, or By Format", inline=False)
+    embed.set_footer(text="Only Won and Missed projects are counted")
 
     await interaction.response.send_message(
         embed=embed,
