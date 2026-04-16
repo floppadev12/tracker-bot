@@ -123,7 +123,6 @@ async def init_db():
     async with db_pool.acquire() as conn:
         await conn.execute(SCHEMA_SQL)
 
-        # Default segments
         for name in ["Build", "Script", "UI", "Thumbnail"]:
             await conn.execute(
                 "INSERT INTO segments (name) VALUES ($1) ON CONFLICT (name) DO NOTHING",
@@ -321,10 +320,7 @@ async def set_project_status(project_id: int, status: str):
 async def create_field(name: str) -> bool:
     async with db_pool.acquire() as conn:
         try:
-            await conn.execute(
-                "INSERT INTO fields (name) VALUES ($1)",
-                name,
-            )
+            await conn.execute("INSERT INTO fields (name) VALUES ($1)", name)
             return True
         except asyncpg.UniqueViolationError:
             return False
@@ -544,9 +540,9 @@ def build_winrate_embed(title: str, won: int, missed: int) -> discord.Embed:
     return embed
 
 
-def build_maintenance_embed() -> discord.Embed:
+def build_edit_embed() -> discord.Embed:
     embed = discord.Embed(
-        title="🛠️ Maintenance Panel",
+        title="🛠️ Edit Panel",
         description=(
             "Manage fields, formats, segments, and project corrections.\n\n"
             "Choose an action from the menu below."
@@ -568,7 +564,7 @@ def build_maintenance_embed() -> discord.Embed:
         ),
         inline=False,
     )
-    embed.set_footer(text="Restricted to the maintenance role")
+    embed.set_footer(text="Restricted to the edit role")
     return embed
 
 
@@ -644,8 +640,8 @@ class ConfirmStatusModal(discord.ui.Modal):
         super().__init__(title=title_map[action])
 
         self.confirm_input = discord.ui.TextInput(
-            label='Type CONFIRM',
-            placeholder='CONFIRM',
+            label="Type CONFIRM",
+            placeholder="CONFIRM",
             required=True,
             max_length=20
         )
@@ -696,13 +692,13 @@ class ProjectHomeView(discord.ui.View):
         fields = await fetch_fields()
         if not fields:
             return await interaction.response.send_message(
-                "There are no fields yet. Ask someone with the maintenance role to add one.",
+                "There are no fields yet. Ask someone with the edit role to add one.",
                 ephemeral=True,
             )
 
         await interaction.response.send_message(
             "Choose a field for the new project:",
-            view=FieldSelectView(mode="create"),
+            view=await FieldSelectView(mode="create").setup(),
             ephemeral=True,
         )
 
@@ -717,7 +713,7 @@ class ProjectHomeView(discord.ui.View):
 
         await interaction.response.send_message(
             "Choose a field to track a project:",
-            view=FieldSelectView(mode="track"),
+            view=await FieldSelectView(mode="track").setup(),
             ephemeral=True,
         )
 
@@ -725,8 +721,6 @@ class ProjectHomeView(discord.ui.View):
 class FieldSelect(discord.ui.Select):
     def __init__(self, mode: str):
         self.mode = mode
-        self.selected_field_id: Optional[int] = None
-
         super().__init__(
             placeholder="Select a field...",
             min_values=1,
@@ -753,7 +747,7 @@ class FieldSelect(discord.ui.Select):
 
         await interaction.response.send_message(
             "Choose a format:",
-            view=FormatSelectView(mode=self.mode, field_id=field_id),
+            view=await FormatSelectView(mode=self.mode, field_id=field_id).setup(),
             ephemeral=True,
         )
 
@@ -803,7 +797,7 @@ class FormatSelect(discord.ui.Select):
 
         await interaction.response.send_message(
             "Choose a project:",
-            view=ProjectSelectView(self.field_id, format_id),
+            view=await ProjectSelectView(self.field_id, format_id).setup(),
             ephemeral=True,
         )
 
@@ -1249,9 +1243,9 @@ class WinrateFormatSelect(discord.ui.Select):
 
 
 # -----------------------------
-# /maintenance flow
+# /edit flow
 # -----------------------------
-MAINTENANCE_ACTIONS = [
+EDIT_ACTIONS = [
     ("Add Field", "add_field", "➕"),
     ("Delete Field", "delete_field", "🗑️"),
     ("Add Format", "add_format", "➕"),
@@ -1266,20 +1260,20 @@ MAINTENANCE_ACTIONS = [
 ]
 
 
-class MaintenanceMenuView(discord.ui.View):
+class EditMenuView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=300)
-        self.add_item(MaintenanceMenuSelect())
+        self.add_item(EditMenuSelect())
 
 
-class MaintenanceMenuSelect(discord.ui.Select):
+class EditMenuSelect(discord.ui.Select):
     def __init__(self):
         options = [
             discord.SelectOption(label=label, value=value, emoji=emoji)
-            for label, value, emoji in MAINTENANCE_ACTIONS
+            for label, value, emoji in EDIT_ACTIONS
         ]
         super().__init__(
-            placeholder="Choose a maintenance action...",
+            placeholder="Choose an edit action...",
             min_values=1,
             max_values=1,
             options=options,
@@ -1287,7 +1281,7 @@ class MaintenanceMenuSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         if not has_maintenance_role(interaction):
-            return await interaction.response.send_message("You do not have permission to use maintenance.", ephemeral=True)
+            return await interaction.response.send_message("You do not have permission to use edit.", ephemeral=True)
 
         action = self.values[0]
 
@@ -1298,31 +1292,31 @@ class MaintenanceMenuSelect(discord.ui.Select):
         if action == "delete_field":
             return await interaction.response.send_message(
                 "Choose a field to delete:",
-                view=await MaintenanceFieldView("delete_field").setup(),
+                view=await EditFieldView("delete_field").setup(),
                 ephemeral=True,
             )
         if action == "add_format":
             return await interaction.response.send_message(
                 "Choose a field for the new format:",
-                view=await MaintenanceFieldView("add_format").setup(),
+                view=await EditFieldView("add_format").setup(),
                 ephemeral=True,
             )
         if action == "delete_format":
             return await interaction.response.send_message(
                 "Choose a field first:",
-                view=await MaintenanceFieldView("delete_format").setup(),
+                view=await EditFieldView("delete_format").setup(),
                 ephemeral=True,
             )
         if action == "delete_segment":
             return await interaction.response.send_message(
                 "Choose a segment to delete:",
-                view=await MaintenanceSegmentView("delete_segment").setup(),
+                view=await EditSegmentView("delete_segment").setup(),
                 ephemeral=True,
             )
         if action in {"rename_project", "move_project", "change_status", "reopen_project", "set_segment_hours"}:
             return await interaction.response.send_message(
                 "Choose a field first:",
-                view=await MaintenanceFieldView(action).setup(),
+                view=await EditFieldView(action).setup(),
                 ephemeral=True,
             )
 
@@ -1381,10 +1375,10 @@ class AddFormatModal(discord.ui.Modal, title="Add Format"):
         await interaction.response.send_message(f"Added format **{value}**.", ephemeral=True)
 
 
-class MaintenanceFieldView(discord.ui.View):
+class EditFieldView(discord.ui.View):
     def __init__(self, action: str):
         super().__init__(timeout=300)
-        self.select = MaintenanceFieldSelect(action)
+        self.select = EditFieldSelect(action)
         self.add_item(self.select)
 
     async def setup(self):
@@ -1392,7 +1386,7 @@ class MaintenanceFieldView(discord.ui.View):
         return self
 
 
-class MaintenanceFieldSelect(discord.ui.Select):
+class EditFieldSelect(discord.ui.Select):
     def __init__(self, action: str):
         self.action = action
         super().__init__(
@@ -1422,7 +1416,7 @@ class MaintenanceFieldSelect(discord.ui.Select):
                 return await interaction.response.send_message("This field has no formats.", ephemeral=True)
             return await interaction.response.send_message(
                 "Choose a format:",
-                view=await MaintenanceFormatView(field_id, self.action).setup(),
+                view=await EditFormatView(field_id, self.action).setup(),
                 ephemeral=True,
             )
 
@@ -1432,15 +1426,15 @@ class MaintenanceFieldSelect(discord.ui.Select):
                 return await interaction.response.send_message("This field has no formats.", ephemeral=True)
             return await interaction.response.send_message(
                 "Choose a format:",
-                view=await MaintenanceFormatView(field_id, self.action).setup(),
+                view=await EditFormatView(field_id, self.action).setup(),
                 ephemeral=True,
             )
 
 
-class MaintenanceFormatView(discord.ui.View):
+class EditFormatView(discord.ui.View):
     def __init__(self, field_id: int, action: str):
         super().__init__(timeout=300)
-        self.select = MaintenanceFormatSelect(field_id, action)
+        self.select = EditFormatSelect(field_id, action)
         self.add_item(self.select)
 
     async def setup(self):
@@ -1448,7 +1442,7 @@ class MaintenanceFormatView(discord.ui.View):
         return self
 
 
-class MaintenanceFormatSelect(discord.ui.Select):
+class EditFormatSelect(discord.ui.Select):
     def __init__(self, field_id: int, action: str):
         self.field_id = field_id
         self.action = action
@@ -1476,15 +1470,15 @@ class MaintenanceFormatSelect(discord.ui.Select):
 
         await interaction.response.send_message(
             "Choose a project:",
-            view=await MaintenanceProjectView(self.action, self.field_id, format_id).setup(),
+            view=await EditProjectView(self.action, self.field_id, format_id).setup(),
             ephemeral=True,
         )
 
 
-class MaintenanceProjectView(discord.ui.View):
+class EditProjectView(discord.ui.View):
     def __init__(self, action: str, field_id: int, format_id: int):
         super().__init__(timeout=300)
-        self.select = MaintenanceProjectSelect(action, field_id, format_id)
+        self.select = EditProjectSelect(action, field_id, format_id)
         self.add_item(self.select)
 
     async def setup(self):
@@ -1492,7 +1486,7 @@ class MaintenanceProjectView(discord.ui.View):
         return self
 
 
-class MaintenanceProjectSelect(discord.ui.Select):
+class EditProjectSelect(discord.ui.Select):
     def __init__(self, action: str, field_id: int, format_id: int):
         self.action = action
         self.field_id = field_id
@@ -1669,10 +1663,10 @@ class ChangeStatusSelect(discord.ui.Select):
         await interaction.response.send_message(f"Project status changed to **{status}**.", ephemeral=True)
 
 
-class MaintenanceSegmentView(discord.ui.View):
+class EditSegmentView(discord.ui.View):
     def __init__(self, action: str):
         super().__init__(timeout=300)
-        self.select = MaintenanceSegmentSelect(action)
+        self.select = EditSegmentSelect(action)
         self.add_item(self.select)
 
     async def setup(self):
@@ -1680,7 +1674,7 @@ class MaintenanceSegmentView(discord.ui.View):
         return self
 
 
-class MaintenanceSegmentSelect(discord.ui.Select):
+class EditSegmentSelect(discord.ui.Select):
     def __init__(self, action: str):
         self.action = action
         super().__init__(
@@ -1782,7 +1776,7 @@ async def add_command(interaction: discord.Interaction):
     fields = await fetch_fields()
     if not fields:
         return await interaction.response.send_message(
-            "There are no fields yet. Ask someone with the maintenance role to add one.",
+            "There are no fields yet. Ask someone with the edit role to add one.",
             ephemeral=True,
         )
 
@@ -1811,8 +1805,8 @@ async def winrate_command(interaction: discord.Interaction):
     )
 
 
-@tree.command(name="maintenance", description="Open the maintenance panel", guild=discord.Object(id=GUILD_ID))
-async def maintenance_command(interaction: discord.Interaction):
+@tree.command(name="edit", description="Open the edit panel", guild=discord.Object(id=GUILD_ID))
+async def edit_command(interaction: discord.Interaction):
     if not has_maintenance_role(interaction):
         return await interaction.response.send_message(
             "You do not have permission to use this command.",
@@ -1820,8 +1814,8 @@ async def maintenance_command(interaction: discord.Interaction):
         )
 
     await interaction.response.send_message(
-        embed=build_maintenance_embed(),
-        view=MaintenanceMenuView(),
+        embed=build_edit_embed(),
+        view=EditMenuView(),
         ephemeral=True,
     )
 
@@ -1838,73 +1832,9 @@ async def on_ready():
 @bot.event
 async def setup_hook():
     await init_db()
-
-    # These dynamic views are created per interaction, so no persistent setup needed.
     guild = discord.Object(id=GUILD_ID)
     synced = await tree.sync(guild=guild)
     print(f"Synced {len(synced)} command(s) to guild {GUILD_ID}")
-
-
-# -----------------------------
-# Patch helpers for initial view setup
-# -----------------------------
-# We need setup() to be called before sending some views.
-# This keeps command code clean.
-_original_project_callback = project_command.callback
-
-
-# -----------------------------
-# Monkey-safe wrappers not needed, but keep startup clean
-# -----------------------------
-async def build_field_view(mode: str):
-    return await FieldSelectView(mode).setup()
-
-
-async def build_format_view(mode: str, field_id: int):
-    return await FormatSelectView(mode, field_id).setup()
-
-
-# Rebind callbacks that need async setup creation
-async def project_command_impl(interaction: discord.Interaction):
-    await interaction.response.send_message(
-        embed=build_home_embed(),
-        view=ProjectHomeView(),
-        ephemeral=True,
-    )
-
-
-project_command.callback = project_command_impl
-
-
-# Override button callbacks to use setup() views
-async def create_project_button_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
-    fields = await fetch_fields()
-    if not fields:
-        return await interaction.response.send_message(
-            "There are no fields yet. Ask someone with the maintenance role to add one.",
-            ephemeral=True,
-        )
-    await interaction.response.send_message(
-        "Choose a field for the new project:",
-        view=await FieldSelectView(mode="create").setup(),
-        ephemeral=True,
-    )
-
-
-async def track_project_button_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
-    fields = await fetch_fields()
-    if not fields:
-        return await interaction.response.send_message("There are no fields yet.", ephemeral=True)
-
-    await interaction.response.send_message(
-        "Choose a field to track a project:",
-        view=await FieldSelectView(mode="track").setup(),
-        ephemeral=True,
-    )
-
-
-ProjectHomeView.create_project_button.callback = create_project_button_callback
-ProjectHomeView.track_project_button.callback = track_project_button_callback
 
 
 # -----------------------------
