@@ -1638,33 +1638,46 @@ class EditMenuSelect(discord.ui.Select):
 
         if action == "add_field":
             return await interaction.response.send_modal(SimpleNameModal("Add Field", "Field Name", "field"))
+
         if action == "add_segment":
             return await interaction.response.send_modal(SimpleNameModal("Add Segment", "Segment Name", "segment"))
+
         if action == "delete_field":
             return await interaction.response.send_message(
                 "Choose a field to delete:",
                 view=await EditFieldView("delete_field").setup(),
                 ephemeral=True,
             )
+
         if action == "add_format":
             return await interaction.response.send_message(
                 "Choose a field for the new format:",
                 view=await EditFieldView("add_format").setup(),
                 ephemeral=True,
             )
+
         if action == "delete_format":
             return await interaction.response.send_message(
                 "Choose a field first:",
                 view=await EditFieldView("delete_format").setup(),
                 ephemeral=True,
             )
+
         if action == "delete_segment":
             return await interaction.response.send_message(
                 "Choose a segment to delete:",
                 view=await EditSegmentView("delete_segment").setup(),
                 ephemeral=True,
             )
-        if action in {"rename_project", "move_project", "delete_project", "change_status", "reopen_project", "set_segment_hours"}:
+
+        if action in {
+            "rename_project",
+            "move_project",
+            "delete_project",
+            "change_status",
+            "reopen_project",
+            "set_segment_hours",
+        }:
             return await interaction.response.send_message(
                 "Choose a field first:",
                 view=await EditFieldView(action).setup(),
@@ -1756,7 +1769,10 @@ class EditFieldSelect(discord.ui.Select):
 
         if self.action == "delete_field":
             await delete_field(field_id)
-            return await interaction.response.send_message("Field deleted. Everything inside it was also deleted.", ephemeral=True)
+            return await interaction.response.send_message(
+                "Field deleted. Everything inside it was also deleted.",
+                ephemeral=True,
+            )
 
         if self.action == "add_format":
             return await interaction.response.send_modal(AddFormatModal(field_id))
@@ -1771,7 +1787,14 @@ class EditFieldSelect(discord.ui.Select):
                 ephemeral=True,
             )
 
-        if self.action in {"rename_project", "move_project", "delete_project", "change_status", "reopen_project", "set_segment_hours"}:
+        if self.action in {
+            "rename_project",
+            "move_project",
+            "delete_project",
+            "change_status",
+            "reopen_project",
+            "set_segment_hours",
+        }:
             formats = await fetch_formats(field_id)
             if not formats:
                 return await interaction.response.send_message("This field has no formats.", ephemeral=True)
@@ -1813,7 +1836,10 @@ class EditFormatSelect(discord.ui.Select):
 
         if self.action == "delete_format":
             await delete_format(format_id)
-            return await interaction.response.send_message("Format deleted. Everything inside it was also deleted.", ephemeral=True)
+            return await interaction.response.send_message(
+                "Format deleted. Everything inside it was also deleted.",
+                ephemeral=True,
+            )
 
         projects = await fetch_projects(self.field_id, format_id)
         if not projects:
@@ -1890,7 +1916,10 @@ class EditProjectSelect(discord.ui.Select):
                     ephemeral=True,
                 )
             await set_project_status(project_id, "in_development")
-            return await interaction.response.send_message("Project reopened to **In Development**.", ephemeral=True)
+            return await interaction.response.send_message(
+                "Project reopened to **In Development**.",
+                ephemeral=True,
+            )
 
         if self.action == "set_segment_hours":
             return await interaction.response.send_message(
