@@ -459,10 +459,6 @@ def build_project_embed(project: asyncpg.Record, segment_rows: List[asyncpg.Reco
     }
 
     total_minutes = sum(int(row["minutes"]) for row in segment_rows)
-    hours_text = "\n".join(
-        f"**{row['segment_name']}** — {format_duration(int(row['minutes']))}"
-        for row in segment_rows
-    ) or "No hours added yet."
 
     release_date = "Not released yet"
     if project["released_at"]:
@@ -481,27 +477,38 @@ def build_project_embed(project: asyncpg.Record, segment_rows: List[asyncpg.Reco
     embed.add_field(name="🧩 Format", value=project["format_name"], inline=True)
     embed.add_field(name="📌 Status", value=status_map.get(project["status"], project["status"]), inline=True)
 
-    embed.add_field(name="⏱️ Hours by Segment", value=hours_text, inline=False)
+    left_segments = []
+    right_segments = []
+
+    for index, row in enumerate(segment_rows):
+        line = f"**{row['segment_name']}** — {format_duration(int(row['minutes']))}"
+        if index % 2 == 0:
+            left_segments.append(line)
+        else:
+            right_segments.append(line)
+
+    embed.add_field(
+        name="⏱️ Hours",
+        value="\n".join(left_segments) if left_segments else "No hours added yet.",
+        inline=True,
+    )
+
+    embed.add_field(
+        name="\u200b",
+        value="\n".join(right_segments) if right_segments else "\u200b",
+        inline=True,
+    )
+
+    embed.add_field(
+        name="\u200b",
+        value="\u200b",
+        inline=True,
+    )
+
     embed.add_field(name="🕒 Total Hours", value=format_duration(total_minutes), inline=True)
     embed.add_field(name="📅 Release Date", value=release_date, inline=True)
+    embed.add_field(name="\u200b", value="\u200b", inline=True)
 
-    return embed
-
-
-def build_winrate_embed(title: str, won: int, missed: int) -> discord.Embed:
-    total = won + missed
-    winrate = (won / total * 100) if total > 0 else 0.0
-
-    embed = discord.Embed(
-        title=f"📈 {title}",
-        description="Winrate is calculated only from projects marked as **Won** or **Missed**.",
-        color=EMBED_COLOR,
-        timestamp=utcnow(),
-    )
-    embed.add_field(name="🏆 Won", value=str(won), inline=True)
-    embed.add_field(name="❌ Missed", value=str(missed), inline=True)
-    embed.add_field(name="📦 Counted", value=str(total), inline=True)
-    embed.add_field(name="📊 Winrate", value=f"**{winrate:.1f}%**", inline=False)
     return embed
 
 
