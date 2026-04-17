@@ -606,6 +606,56 @@ async def fetch_format_leaderboard_rows() -> List[asyncpg.Record]:
         )
 
 
+async def fetch_format_leaderboard_rows_by_field(field_id: int) -> List[asyncpg.Record]:
+    async with db_pool.acquire() as conn:
+        return await conn.fetch(
+            """
+            WITH project_totals AS (
+                SELECT
+                    p.id AS project_id,
+                    p.field_id,
+                    p.format_id,
+                    p.status,
+                    COALESCE(SUM(psh.minutes), 0) AS total_minutes
+                FROM projects p
+                LEFT JOIN project_segment_hours psh
+                    ON psh.project_id = p.id
+                WHERE p.status IN ('won', 'missed')
+                  AND p.field_id = $1
+                GROUP BY p.id, p.field_id, p.format_id, p.status
+            )
+            SELECT
+                fm.id,
+                fm.name,
+                COUNT(*) FILTER (WHERE pt.status = 'won') AS won,
+                COUNT(*) FILTER (WHERE pt.status = 'missed') AS missed,
+                COUNT(pt.project_id) AS finished_count,
+                COALESCE(SUM(pt.total_minutes), 0) AS total_minutes_finished,
+                CASE
+                    WHEN COUNT(pt.project_id) > 0
+                    THEN COALESCE(SUM(pt.total_minutes), 0)::FLOAT / COUNT(pt.project_id)
+                    ELSE 0
+                END AS avg_minutes
+            FROM formats fm
+            LEFT JOIN project_totals pt
+                ON pt.format_id = fm.id
+            WHERE fm.field_id = $1
+            GROUP BY fm.id, fm.name
+            HAVING COUNT(pt.project_id) > 0
+            ORDER BY
+                (COUNT(*) FILTER (WHERE pt.status = 'won'))::FLOAT / NULLIF(COUNT(pt.project_id), 0) DESC,
+                CASE
+                    WHEN COUNT(pt.project_id) > 0
+                    THEN COALESCE(SUM(pt.total_minutes), 0)::FLOAT / COUNT(pt.project_id)
+                    ELSE 0
+                END ASC,
+                COUNT(pt.project_id) DESC,
+                fm.name ASC
+            """,
+            field_id,
+        )
+
+
 # -----------------------------
 # Embed builders
 # -----------------------------
@@ -1496,6 +1546,48 @@ class SummaryFormatSelect(discord.ui.Select):
 # -----------------------------
 # /lead flow
 # -----------------------------
+class TargetFormatFieldSelectView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+        self.select = TargetFormatFieldSelect()
+        self.add_item(self.select)
+
+    async def setup(self):
+        await self.select.refresh_options()
+        return self
+
+
+class TargetFormatFieldSelect(discord.ui.Select):
+    def __init__(self):
+        super().__init__(
+            placeholder="Select a field...",
+            min_values=1,
+            max_values=1,
+            options=[discord.SelectOption(label="Loading...", value="0")]
+        )
+
+    async def refresh_options(self):
+        rows = await fetch_fields()
+        self.options = [
+            discord.SelectOption(label=row["name"][:100], value=str(row["id"]))
+            for row in rows[:25]
+        ]
+
+    async def callback(self, interaction: discord.Interaction):
+        field_id = int(self.values[0])
+
+        field = await fetch_field(field_id)
+        if not field:
+            return await interaction.response.send_message("Field not found.", ephemeral=True)
+
+        rows = await fetch_format_leaderboard_rows_by_field(field_id)
+
+        await interaction.response.send_message(
+            embed=build_lead_embed(rows, f"Target Format Leaderboard — {field['name']}"),
+            ephemeral=True,
+        )
+
+
 class LeadMenuView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=300)
@@ -1513,6 +1605,21 @@ class LeadMenuView(discord.ui.View):
         rows = await fetch_format_leaderboard_rows()
         await interaction.response.send_message(
             embed=build_lead_embed(rows, "Format Leaderboard"),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Target Format", emoji="🎯", style=discord.ButtonStyle.secondary)
+    async def target_format_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        fields = await fetch_fields()
+        if not fields:
+            return await interaction.response.send_message(
+                "There are no fields yet.",
+                ephemeral=True,
+            )
+
+        await interaction.response.send_message(
+            "Choose a field:",
+            view=await TargetFormatFieldSelectView().setup(),
             ephemeral=True,
         )
 
@@ -2253,11 +2360,11 @@ async def summary_command(interaction: discord.Interaction):
     )
 
 
-@tree.command(name="lead", description="Show the field or format leaderboard", guild=discord.Object(id=GUILD_ID))
+@tree.command(name="lead", description="Show the field, format, or target format leaderboard", guild=discord.Object(id=GUILD_ID))
 async def lead_command(interaction: discord.Interaction):
     embed = discord.Embed(
         title="📊 Leaderboard Panel",
-        description="Choose whether you want the **Field** leaderboard or the **Format** leaderboard.",
+        description="Choose whether you want the **Field**, **Format**, or **Target Format** leaderboard.",
         color=EMBED_COLOR,
         timestamp=utcnow(),
     )
