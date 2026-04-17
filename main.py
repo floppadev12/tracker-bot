@@ -560,6 +560,52 @@ async def fetch_field_leaderboard_rows() -> List[asyncpg.Record]:
         )
 
 
+async def fetch_format_leaderboard_rows() -> List[asyncpg.Record]:
+    async with db_pool.acquire() as conn:
+        return await conn.fetch(
+            """
+            WITH project_totals AS (
+                SELECT
+                    p.id AS project_id,
+                    p.format_id,
+                    p.status,
+                    COALESCE(SUM(psh.minutes), 0) AS total_minutes
+                FROM projects p
+                LEFT JOIN project_segment_hours psh
+                    ON psh.project_id = p.id
+                WHERE p.status IN ('won', 'missed')
+                GROUP BY p.id, p.format_id, p.status
+            )
+            SELECT
+                fm.id,
+                fm.name,
+                COUNT(*) FILTER (WHERE pt.status = 'won') AS won,
+                COUNT(*) FILTER (WHERE pt.status = 'missed') AS missed,
+                COUNT(pt.project_id) AS finished_count,
+                COALESCE(SUM(pt.total_minutes), 0) AS total_minutes_finished,
+                CASE
+                    WHEN COUNT(pt.project_id) > 0
+                    THEN COALESCE(SUM(pt.total_minutes), 0)::FLOAT / COUNT(pt.project_id)
+                    ELSE 0
+                END AS avg_minutes
+            FROM formats fm
+            LEFT JOIN project_totals pt
+                ON pt.format_id = fm.id
+            GROUP BY fm.id, fm.name
+            HAVING COUNT(pt.project_id) > 0
+            ORDER BY
+                (COUNT(*) FILTER (WHERE pt.status = 'won'))::FLOAT / NULLIF(COUNT(pt.project_id), 0) DESC,
+                CASE
+                    WHEN COUNT(pt.project_id) > 0
+                    THEN COALESCE(SUM(pt.total_minutes), 0)::FLOAT / COUNT(pt.project_id)
+                    ELSE 0
+                END ASC,
+                COUNT(pt.project_id) DESC,
+                fm.name ASC
+            """
+        )
+
+
 # -----------------------------
 # Embed builders
 # -----------------------------
@@ -708,7 +754,7 @@ def build_field_summary_embed(field_name: str, format_rows: List[asyncpg.Record]
     return embed
 
 
-def build_lead_embed(rows: List[asyncpg.Record]) -> discord.Embed:
+def build_lead_embed(rows: List[asyncpg.Record], title: str = "Field Leaderboard") -> discord.Embed:
     if not rows:
         description = "No finished projects yet."
     else:
@@ -735,7 +781,7 @@ def build_lead_embed(rows: List[asyncpg.Record]) -> discord.Embed:
         description = "\n".join(lines)
 
     embed = discord.Embed(
-        title="Field Leaderboard",
+        title=title,
         description=description,
         color=EMBED_COLOR,
         timestamp=utcnow(),
@@ -1443,6 +1489,30 @@ class SummaryFormatSelect(discord.ui.Select):
 
         await interaction.response.send_message(
             embed=build_format_summary_embed(format_row["name"], project_rows, won, missed),
+            ephemeral=True,
+        )
+
+
+# -----------------------------
+# /lead flow
+# -----------------------------
+class LeadMenuView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    @discord.ui.button(label="Field", emoji="📁", style=discord.ButtonStyle.secondary)
+    async def field_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        rows = await fetch_field_leaderboard_rows()
+        await interaction.response.send_message(
+            embed=build_lead_embed(rows, "Field Leaderboard"),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Format", emoji="📦", style=discord.ButtonStyle.secondary)
+    async def format_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        rows = await fetch_format_leaderboard_rows()
+        await interaction.response.send_message(
+            embed=build_lead_embed(rows, "Format Leaderboard"),
             ephemeral=True,
         )
 
@@ -2183,11 +2253,18 @@ async def summary_command(interaction: discord.Interaction):
     )
 
 
-@tree.command(name="lead", description="Show the field leaderboard", guild=discord.Object(id=GUILD_ID))
+@tree.command(name="lead", description="Show the field or format leaderboard", guild=discord.Object(id=GUILD_ID))
 async def lead_command(interaction: discord.Interaction):
-    rows = await fetch_field_leaderboard_rows()
+    embed = discord.Embed(
+        title="📊 Leaderboard Panel",
+        description="Choose whether you want the **Field** leaderboard or the **Format** leaderboard.",
+        color=EMBED_COLOR,
+        timestamp=utcnow(),
+    )
+
     await interaction.response.send_message(
-        embed=build_lead_embed(rows),
+        embed=embed,
+        view=LeadMenuView(),
         ephemeral=True,
     )
 
