@@ -263,6 +263,25 @@ def build_summary_text(title: str, total: dt.timedelta, totals: dict[str, dt.tim
     return "\n".join(lines)
 
 
+def make_embed(title: str | None = None, description: str | None = None):
+    return discord.Embed(title=title, description=description, color=EMBED_COLOR)
+
+
+def build_summary_embed(title: str, total: dt.timedelta, totals: dict[str, dt.timedelta]):
+    description = f"⏱️ Total worked: **{format_duration(total)}**"
+    embed = make_embed(title, description)
+    if not totals:
+        embed.add_field(name="Tasks", value="No tracked time yet.", inline=False)
+        return embed
+
+    task_lines = [
+        f"**{name}**: {format_duration(duration)}"
+        for name, duration in sorted(totals.items(), key=lambda item: item[1], reverse=True)
+    ]
+    embed.add_field(name="Task breakdown", value="\n".join(task_lines)[:1024], inline=False)
+    return embed
+
+
 def split_discord_messages(text: str, limit=1900):
     chunks = []
     current = []
@@ -299,7 +318,7 @@ class TaskSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         if not self.future.done():
             self.future.set_result((int(self.values[0]), interaction.created_at))
-        await interaction.response.send_message("Saved.", ephemeral=True)
+        await interaction.response.send_message("✅ Saved.", ephemeral=True)
         self.view.stop()
 
 
@@ -314,18 +333,24 @@ class StartDayTaskModal(discord.ui.Modal, title="Start productivity day"):
 
     async def on_submit(self, interaction: discord.Interaction):
         if get_active_day(interaction.user.id):
-            await interaction.response.send_message("You already have an active day. Use `/closeday` first.", ephemeral=True)
+            await interaction.response.send_message(
+                embed=make_embed("Active Day", "⚠️ You already have an active day. Use `/closeday` first."),
+                ephemeral=True,
+            )
             return
 
         ensure_profile(interaction.user)
         task_names = [line.strip() for line in str(self.task_list).splitlines() if line.strip()]
         task_names = [name for name in task_names if name.lower() != SELF_CARE_TASK.lower()]
         if not task_names:
-            await interaction.response.send_message("No tasks found. Start again and enter at least one task.", ephemeral=True)
+            await interaction.response.send_message(
+                embed=make_embed("No Tasks Found", "Add at least one task and start again."),
+                ephemeral=True,
+            )
             return
         if len(task_names) > MAX_CUSTOM_TASKS:
             await interaction.response.send_message(
-                f"Too many tasks. Enter up to {MAX_CUSTOM_TASKS} tasks plus Self-care.",
+                embed=make_embed("Too Many Tasks", f"Enter up to **{MAX_CUSTOM_TASKS}** tasks plus Self-care."),
                 ephemeral=True,
             )
             return
@@ -335,8 +360,10 @@ class StartDayTaskModal(discord.ui.Modal, title="Start productivity day"):
         profile = get_profile(interaction.user.id)
         display_name = profile["display_name"] if profile else interaction.user.display_name
         await interaction.response.send_message(
-            f"👋 Welcome back, **{display_name}**.\n"
-            f"Day started with **{len(task_names)}** tasks. Check your DMs to choose your starting task.",
+            embed=make_embed(
+                f"Welcome back, {display_name}",
+                f"👋 Day started with **{len(task_names)}** tasks.\nCheck your DMs to choose what you are starting with.",
+            ),
             ephemeral=True,
         )
         asyncio.create_task(run_checkin(interaction.user.id, "Choose what you are starting with.", started_at))
@@ -352,7 +379,7 @@ async def ask_task_choice(user: discord.User, day_id: int, reason: str):
         try:
             view = TaskSelectView(task_rows, prompt)
             await user.send(
-                f"📌 **{PROJECT_NAME} productivity check-in**\n{reason}\nChoose your current task:",
+                embed=make_embed(f"📌 {PROJECT_NAME} productivity check-in", reason),
                 view=view,
             )
             task_id, answered_at = await asyncio.wait_for(view.future, timeout=timeout)
@@ -485,7 +512,13 @@ def weekly_summary(user_id: int, anchor: dt.date):
 
 
 def get_font(size: int, bold=False):
-    names = ["arialbd.ttf" if bold else "arial.ttf", "seguiemj.ttf", "calibri.ttf"]
+    names = [
+        "C:/Windows/Fonts/segoeuib.ttf" if bold else "C:/Windows/Fonts/segoeui.ttf",
+        "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        "arialbd.ttf" if bold else "arial.ttf",
+    ]
     for name in names:
         try:
             return ImageFont.truetype(name, size)
@@ -495,49 +528,95 @@ def get_font(size: int, bold=False):
 
 
 def make_dashboard_image(profile, daily, week_total, task_totals, anchor: dt.date):
-    width, height = 1200, 800
-    image = Image.new("RGB", (width, height), "#07111f")
+    width, height = 1400, 820
+    image = Image.new("RGB", (width, height), "#050b16")
     draw = ImageDraw.Draw(image)
-    title_font = get_font(48, True)
-    heading_font = get_font(28, True)
-    body_font = get_font(24)
+    title_font = get_font(56, True)
+    metric_font = get_font(46, True)
+    heading_font = get_font(30, True)
+    body_font = get_font(23)
     small_font = get_font(18)
+    tiny_font = get_font(15)
 
     for y in range(height):
-        blue = 31 + int(y / height * 30)
-        draw.line((0, y, width, y), fill=(7, 17, blue))
+        for x in range(width):
+            r = 5 + int((x / width) * 8)
+            g = 10 + int((y / height) * 16)
+            b = 24 + int((x / width) * 36) + int((y / height) * 18)
+            image.putpixel((x, y), (r, g, min(78, b)))
+
+    def panel(box, fill="#0b1628", outline="#1c3b67"):
+        draw.rounded_rectangle(box, radius=28, fill=fill, outline=outline, width=2)
+
+    def gradient_bar(box, color_a, color_b, radius=10):
+        x1, y1, x2, y2 = box
+        mask = Image.new("L", (x2 - x1, y2 - y1), 0)
+        mask_draw = ImageDraw.Draw(mask)
+        mask_draw.rounded_rectangle((0, 0, x2 - x1, y2 - y1), radius=radius, fill=255)
+        grad = Image.new("RGB", (x2 - x1, y2 - y1), color_a)
+        grad_pixels = grad.load()
+        for gx in range(x2 - x1):
+            ratio = gx / max(1, x2 - x1 - 1)
+            rgb = tuple(int(color_a[i] + (color_b[i] - color_a[i]) * ratio) for i in range(3))
+            for gy in range(y2 - y1):
+                grad_pixels[gx, gy] = rgb
+        image.paste(grad, (x1, y1), mask)
 
     start, end = weekly_range(anchor)
-    draw.rounded_rectangle((40, 40, 1160, 760), radius=24, fill="#0b1628", outline="#17345c", width=2)
-    draw.text((80, 78), "Weekly Productivity", font=title_font, fill="#f5f9ff")
-    draw.text((82, 138), f"{profile['display_name']} | {ROLE_NAME} | {start} to {end - dt.timedelta(days=1)}", font=body_font, fill="#8fb7e8")
-    draw.text((880, 86), format_duration(week_total), font=title_font, fill="#58a6ff")
-    draw.text((884, 142), "total focused time", font=small_font, fill="#9fb3c8")
+    panel((34, 34, 1366, 786), "#071326", "#1e4f87")
+    draw.text((78, 72), "Weekly Productivity", font=title_font, fill="#f7fbff")
+    draw.text(
+        (82, 140),
+        f"{profile['display_name']}  |  {ROLE_NAME}  |  {start} to {end - dt.timedelta(days=1)}",
+        font=body_font,
+        fill="#8fb7e8",
+    )
+
+    panel((940, 72, 1308, 176), "#0d1d35", "#255c99")
+    draw.text((972, 88), format_duration(week_total), font=metric_font, fill="#66c2ff")
+    draw.text((976, 142), "total focused time", font=small_font, fill="#a9bdd4")
 
     max_daily = max([total.total_seconds() for _, total, _ in daily] + [1])
-    x, y = 82, 220
-    draw.text((x, y - 45), "Daily totals", font=heading_font, fill="#f5f9ff")
+    x, y = 82, 246
+    panel((64, 210, 858, 720), "#0a172b", "#193b67")
+    draw.text((x, y - 6), "Daily totals", font=heading_font, fill="#f5f9ff")
+    chart_top = y + 58
+    chart_bottom = 642
+    chart_height = chart_bottom - chart_top
     for index in range(7):
         day = start + dt.timedelta(days=index)
         match = next((item for item in daily if item[0] == day), None)
         total = match[1] if match else dt.timedelta()
-        bar_h = int((total.total_seconds() / max_daily) * 210)
-        bx = x + index * 90
-        draw.rounded_rectangle((bx, y, bx + 54, y + 230), radius=12, fill="#101f36")
-        draw.rounded_rectangle((bx, y + 230 - bar_h, bx + 54, y + 230), radius=12, fill="#2f81f7")
-        draw.text((bx - 2, y + 246), day.strftime("%a"), font=small_font, fill="#c7d7ea")
-        draw.text((bx - 10, y + 272), format_duration(total), font=small_font, fill="#8fb7e8")
+        bar_h = int((total.total_seconds() / max_daily) * chart_height)
+        bx = x + 28 + index * 102
+        draw.rounded_rectangle((bx, chart_top, bx + 58, chart_bottom), radius=16, fill="#0f2541")
+        if bar_h:
+            gradient_bar((bx, chart_bottom - bar_h, bx + 58, chart_bottom), (47, 129, 247), (102, 194, 255), 16)
+        draw.text((bx + 8, chart_bottom + 18), day.strftime("%a"), font=small_font, fill="#dbe9fb")
+        label = format_duration(total)
+        label_w = draw.textbbox((0, 0), label, font=tiny_font)[2]
+        draw.text((bx + 29 - label_w / 2, chart_bottom + 45), label, font=tiny_font, fill="#8fb7e8")
 
-    tx, ty = 760, 220
-    draw.text((tx, ty - 45), "Top tasks", font=heading_font, fill="#f5f9ff")
+    tx, ty = 930, 246
+    panel((900, 210, 1308, 720), "#0a172b", "#193b67")
+    draw.text((tx, ty - 6), "Top tasks", font=heading_font, fill="#f5f9ff")
     max_task = max([duration.total_seconds() for duration in task_totals.values()] + [1])
-    for index, (task, duration) in enumerate(sorted(task_totals.items(), key=lambda item: item[1], reverse=True)[:8]):
-        row_y = ty + index * 56
-        draw.text((tx, row_y), task[:26], font=body_font, fill="#eaf2ff")
-        draw.text((1040, row_y), format_duration(duration), font=small_font, fill="#8fb7e8")
-        bar_w = int((duration.total_seconds() / max_task) * 330)
-        draw.rounded_rectangle((tx, row_y + 32, tx + 330, row_y + 42), radius=5, fill="#10223d")
-        draw.rounded_rectangle((tx, row_y + 32, tx + bar_w, row_y + 42), radius=5, fill="#58a6ff")
+    top_tasks = sorted(task_totals.items(), key=lambda item: item[1], reverse=True)[:7]
+    if not top_tasks:
+        draw.text((tx, ty + 68), "No tracked tasks yet", font=body_font, fill="#8fb7e8")
+    for index, (task, duration) in enumerate(top_tasks):
+        row_y = ty + 62 + index * 58
+        name = task if len(task) <= 24 else task[:21] + "..."
+        draw.text((tx, row_y), name, font=body_font, fill="#edf6ff")
+        duration_text = format_duration(duration)
+        duration_w = draw.textbbox((0, 0), duration_text, font=small_font)[2]
+        draw.text((1266 - duration_w, row_y + 3), duration_text, font=small_font, fill="#9ecfff")
+        bar_w = int((duration.total_seconds() / max_task) * 336)
+        draw.rounded_rectangle((tx, row_y + 34, tx + 336, row_y + 47), radius=7, fill="#102944")
+        if bar_w:
+            gradient_bar((tx, row_y + 34, tx + bar_w, row_y + 47), (88, 166, 255), (53, 229, 255), 7)
+
+    draw.text((82, 738), "Generated by the productivity tracker", font=tiny_font, fill="#597797")
 
     output = os.path.join(tempfile.gettempdir(), f"productivity_week_{profile['discord_user_id']}_{anchor}.png")
     image.save(output)
@@ -550,7 +629,7 @@ async def createprofile(interaction: discord.Interaction, display_name: str, cha
     parsed_channel_id = int(channel_id) if channel_id else None
     ensure_profile(interaction.user, display_name, parsed_channel_id)
     await interaction.response.send_message(
-        f"✅ Profile saved: **{display_name}** | Role: **{ROLE_NAME}**",
+        embed=make_embed("Profile Saved", f"✅ **{display_name}**\nRole: **{ROLE_NAME}**"),
         ephemeral=True,
     )
 
@@ -558,7 +637,10 @@ async def createprofile(interaction: discord.Interaction, display_name: str, cha
 @bot.tree.command(name="startday", description="Start your productivity day and send today's tasks.")
 async def startday(interaction: discord.Interaction):
     if get_active_day(interaction.user.id):
-        await interaction.response.send_message("⚠️ You already have an active day. Use `/closeday` first.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=make_embed("Active Day", "⚠️ You already have an active day. Use `/closeday` first."),
+            ephemeral=True,
+        )
         return
 
     await interaction.response.send_modal(StartDayTaskModal())
@@ -568,14 +650,17 @@ async def startday(interaction: discord.Interaction):
 async def closeday(interaction: discord.Interaction):
     day = get_active_day(interaction.user.id)
     if not day:
-        await interaction.response.send_message("⚠️ You do not have an active day.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=make_embed("No Active Day", "⚠️ You do not have an active day."),
+            ephemeral=True,
+        )
         return
 
     closed_at = utc_now()
     db_exec("UPDATE task_segments SET ended_at = %s WHERE day_id = %s AND ended_at IS NULL", (closed_at, day["id"]))
     db_exec("UPDATE work_days SET status = 'closed', closed_at = %s, next_checkin_at = NULL WHERE id = %s", (closed_at, day["id"]))
     total, totals = day_summary(day["id"], closed_at)
-    await interaction.response.send_message(build_summary_text("✅ Day closed", total, totals))
+    await interaction.response.send_message(embed=build_summary_embed("✅ Day Closed", total, totals))
 
 
 @bot.tree.command(name="profile", description="Show a user's saved profile stats.")
@@ -584,7 +669,10 @@ async def profile(interaction: discord.Interaction, user: discord.Member | None 
     target = user or interaction.user
     profile_row = get_profile(target.id)
     if not profile_row:
-        await interaction.response.send_message("⚠️ No profile found for that user.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=make_embed("Profile Missing", "⚠️ No profile found for that user."),
+            ephemeral=True,
+        )
         return
 
     days = db_all(
@@ -597,8 +685,10 @@ async def profile(interaction: discord.Interaction, user: discord.Member | None 
         total += day_total
     average = total / len(days) if days else dt.timedelta()
     await interaction.response.send_message(
-        f"👤 **{profile_row['display_name']}**\nRole: **{ROLE_NAME}**\n"
-        f"📅 Closed days: **{len(days)}**\n⏱️ Daily average: **{format_duration(average)}**"
+        embed=make_embed(
+            f"👤 {profile_row['display_name']}",
+            f"Role: **{ROLE_NAME}**\n📅 Closed days: **{len(days)}**\n⏱️ Daily average: **{format_duration(average)}**",
+        )
     )
 
 
@@ -621,13 +711,13 @@ async def weekly(
     target = user or interaction.user
     profile_row = get_profile(target.id)
     if not profile_row:
-        await interaction.followup.send("⚠️ No profile found for that user.")
+        await interaction.followup.send(embed=make_embed("Profile Missing", "⚠️ No profile found for that user."))
         return
 
     try:
         anchor = parse_local_date(date)
     except ValueError as exc:
-        await interaction.followup.send(str(exc), ephemeral=True)
+        await interaction.followup.send(embed=make_embed("Invalid Date", str(exc)), ephemeral=True)
         return
 
     selected_mode = mode.value if mode else "overview"
@@ -639,16 +729,16 @@ async def weekly(
 
     if selected_mode == "days":
         if not daily:
-            await interaction.followup.send("📭 No days found for that week.")
+            await interaction.followup.send(embed=make_embed("No Days Found", "📭 No days found for that week."))
             return
         for work_date, total, totals in daily:
-            await interaction.followup.send(build_summary_text(str(work_date), total, totals))
+            await interaction.followup.send(embed=build_summary_embed(str(work_date), total, totals))
         return
 
     start, end = weekly_range(anchor)
     text = build_summary_text(f"Week {start} to {end - dt.timedelta(days=1)}", week_total, task_totals)
     for chunk in split_discord_messages(text):
-        await interaction.followup.send(chunk)
+        await interaction.followup.send(embed=make_embed("Weekly Overview", chunk))
 
 
 @bot.tree.command(name="daystats", description="Show one saved day for a user.")
@@ -658,7 +748,7 @@ async def daystats(interaction: discord.Interaction, user: discord.Member | None
     try:
         work_date = parse_local_date(date)
     except ValueError as exc:
-        await interaction.response.send_message(str(exc), ephemeral=True)
+        await interaction.response.send_message(embed=make_embed("Invalid Date", str(exc)), ephemeral=True)
         return
 
     row = db_one(
@@ -672,52 +762,65 @@ async def daystats(interaction: discord.Interaction, user: discord.Member | None
         (target.id, work_date),
     )
     if not row:
-        await interaction.response.send_message("📭 No day found for that date.", ephemeral=True)
+        await interaction.response.send_message(embed=make_embed("No Day Found", "📭 No day found for that date."), ephemeral=True)
         return
     total, totals = day_summary(row["id"], row["closed_at"] or utc_now())
-    await interaction.response.send_message(build_summary_text(str(work_date), total, totals))
+    await interaction.response.send_message(embed=build_summary_embed(str(work_date), total, totals))
 
 
-@bot.tree.command(name="test_profile", description="Test profile saving.")
-async def test_profile(interaction: discord.Interaction):
-    ensure_profile(interaction.user)
-    await interaction.response.send_message("✅ Profile test passed. Use `/createprofile` to set your display name.", ephemeral=True)
-
-
-@bot.tree.command(name="test_startday", description="Test the startday prompt.")
-async def test_startday(interaction: discord.Interaction):
-    await interaction.response.send_message(
-        "Startday test: `/startday` opens a multiline task form, then appends Self-care.",
-        ephemeral=True,
-    )
-
-
-@bot.tree.command(name="test_checkin", description="Send yourself a check-in using your active day.")
-async def test_checkin(interaction: discord.Interaction):
-    if not get_active_day(interaction.user.id):
-        await interaction.response.send_message("⚠️ Start a day first with `/startday`.", ephemeral=True)
+@bot.tree.command(name="test", description="Run a productivity bot test.")
+@app_commands.describe(option="Which test to run")
+@app_commands.choices(
+    option=[
+        app_commands.Choice(name="profile", value="profile"),
+        app_commands.Choice(name="startday", value="startday"),
+        app_commands.Choice(name="checkin", value="checkin"),
+        app_commands.Choice(name="closeday", value="closeday"),
+        app_commands.Choice(name="weekly_graph", value="weekly_graph"),
+    ]
+)
+async def test(interaction: discord.Interaction, option: app_commands.Choice[str]):
+    if option.value == "profile":
+        ensure_profile(interaction.user)
+        await interaction.response.send_message(
+            embed=make_embed("Test Passed", "✅ Profile saving works. Use `/createprofile` to set your display name."),
+            ephemeral=True,
+        )
         return
-    await interaction.response.send_message("📩 Sending test check-in to your DMs.", ephemeral=True)
-    await run_checkin(interaction.user.id, "Manual test check-in.")
 
-
-@bot.tree.command(name="test_closeday", description="Preview your active day totals without closing it.")
-async def test_closeday(interaction: discord.Interaction):
-    day = get_active_day(interaction.user.id)
-    if not day:
-        await interaction.response.send_message("⚠️ No active day to preview.", ephemeral=True)
+    if option.value == "startday":
+        await interaction.response.send_message(
+            embed=make_embed("Startday Test", "`/startday` opens a multiline task form and appends Self-care."),
+            ephemeral=True,
+        )
         return
-    total, totals = day_summary(day["id"])
-    await interaction.response.send_message(build_summary_text("Close day preview", total, totals), ephemeral=True)
 
+    if option.value == "checkin":
+        if not get_active_day(interaction.user.id):
+            await interaction.response.send_message(
+                embed=make_embed("No Active Day", "⚠️ Start a day first with `/startday`."),
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            embed=make_embed("Check-in Test", "📩 Sending a test check-in to your DMs."),
+            ephemeral=True,
+        )
+        await run_checkin(interaction.user.id, "Manual test check-in.")
+        return
 
-@bot.tree.command(name="test_weekly_image", description="Generate a test weekly dashboard image.")
-async def test_weekly_image(interaction: discord.Interaction):
-    await send_weekly_graph_test(interaction)
+    if option.value == "closeday":
+        day = get_active_day(interaction.user.id)
+        if not day:
+            await interaction.response.send_message(
+                embed=make_embed("No Active Day", "⚠️ No active day to preview."),
+                ephemeral=True,
+            )
+            return
+        total, totals = day_summary(day["id"])
+        await interaction.response.send_message(embed=build_summary_embed("Close Day Preview", total, totals), ephemeral=True)
+        return
 
-
-@bot.tree.command(name="test_weekly_graph", description="Generate a test weekly graph image.")
-async def test_weekly_graph(interaction: discord.Interaction):
     await send_weekly_graph_test(interaction)
 
 
