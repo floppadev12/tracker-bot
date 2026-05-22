@@ -25,7 +25,7 @@ PROJECT_NAME = "Project Floppa"
 REPORT_CHANNEL_ID = 1490317756136947942
 TIMEZONE = "Europe/Bratislava"
 USD_PER_ROBUX = 0.0038
-EMBED_COLOR = discord.Color.from_rgb(255, 255, 255)
+EMBED_COLOR = discord.Color(0xFFF9EB)
 
 ROLE_NAME = "Executive"
 SELF_CARE_TASK = "Self-care"
@@ -90,16 +90,23 @@ def init_db():
     db_exec(
         """
         CREATE TABLE IF NOT EXISTS profiles (
-            discord_user_id BIGINT PRIMARY KEY,
+            id SERIAL PRIMARY KEY,
+            owner_discord_user_id BIGINT NOT NULL,
             display_name TEXT NOT NULL,
             role TEXT NOT NULL DEFAULT 'Executive',
             channel_id BIGINT,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (display_name)
         );
-
+        """
+    )
+    migrate_profile_schema()
+    db_exec(
+        """
         CREATE TABLE IF NOT EXISTS work_days (
             id SERIAL PRIMARY KEY,
-            discord_user_id BIGINT NOT NULL REFERENCES profiles(discord_user_id),
+            profile_id INTEGER REFERENCES profiles(id),
+            discord_user_id BIGINT,
             work_date DATE NOT NULL,
             started_at TIMESTAMPTZ NOT NULL,
             closed_at TIMESTAMPTZ,
@@ -134,34 +141,124 @@ def init_db():
         );
         """
     )
+    migrate_profile_schema()
+
+
+def table_has_column(table_name: str, column_name: str):
+    row = db_one(
+        """
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_name = %s AND column_name = %s
+        """,
+        (table_name, column_name),
+    )
+    return row is not None
+
+
+def table_exists(table_name: str):
+    row = db_one("SELECT to_regclass(%s) AS table_name", (table_name,))
+    return bool(row and row["table_name"])
+
+
+def migrate_profile_schema():
+    if not table_has_column("profiles", "owner_discord_user_id"):
+        if table_exists("work_days"):
+            db_exec("ALTER TABLE work_days DROP CONSTRAINT IF EXISTS work_days_discord_user_id_fkey")
+        db_exec("ALTER TABLE profiles RENAME TO profiles_legacy")
+        db_exec(
+            """
+            CREATE TABLE profiles (
+                id SERIAL PRIMARY KEY,
+                owner_discord_user_id BIGINT NOT NULL,
+                display_name TEXT NOT NULL UNIQUE,
+                role TEXT NOT NULL DEFAULT 'Executive',
+                channel_id BIGINT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        db_exec(
+            """
+            INSERT INTO profiles (owner_discord_user_id, display_name, role, channel_id, created_at)
+            SELECT discord_user_id, display_name, role, channel_id, created_at
+            FROM profiles_legacy
+            ON CONFLICT (display_name) DO NOTHING
+            """
+        )
+
+    if not table_exists("work_days"):
+        return
+
+    if not table_has_column("work_days", "profile_id"):
+        db_exec("ALTER TABLE work_days ADD COLUMN profile_id INTEGER")
+
+    db_exec(
+        """
+        UPDATE work_days wd
+        SET profile_id = p.id
+        FROM profiles p
+        WHERE wd.profile_id IS NULL
+          AND wd.discord_user_id IS NOT NULL
+          AND p.owner_discord_user_id = wd.discord_user_id
+        """
+    )
+    db_exec(
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint WHERE conname = 'work_days_profile_id_fkey'
+            ) THEN
+                ALTER TABLE work_days
+                ADD CONSTRAINT work_days_profile_id_fkey
+                FOREIGN KEY (profile_id) REFERENCES profiles(id);
+            END IF;
+        END $$;
+        """
+    )
 
 
 def ensure_profile(user: discord.abc.User, display_name=None, channel_id=None):
     name = display_name or user.display_name
-    db_exec(
+    return db_one(
         """
-        INSERT INTO profiles (discord_user_id, display_name, role, channel_id)
+        INSERT INTO profiles (owner_discord_user_id, display_name, role, channel_id)
         VALUES (%s, %s, %s, %s)
-        ON CONFLICT (discord_user_id)
+        ON CONFLICT (display_name)
         DO UPDATE SET
-            display_name = EXCLUDED.display_name,
+            owner_discord_user_id = EXCLUDED.owner_discord_user_id,
             role = EXCLUDED.role,
             channel_id = COALESCE(EXCLUDED.channel_id, profiles.channel_id)
+        RETURNING *
         """,
         (user.id, name, ROLE_NAME, channel_id),
     )
 
 
-def get_profile(user_id: int):
-    return db_one("SELECT * FROM profiles WHERE discord_user_id = %s", (user_id,))
+def get_profile(profile_id: int):
+    return db_one("SELECT * FROM profiles WHERE id = %s", (profile_id,))
+
+
+def get_default_profile(user_id: int):
+    return db_one(
+        """
+        SELECT *
+        FROM profiles
+        WHERE owner_discord_user_id = %s
+        ORDER BY created_at ASC
+        LIMIT 1
+        """,
+        (user_id,),
+    )
 
 
 def get_profile_by_selector(selector: str | None, fallback_user_id: int):
     if not selector:
-        return get_profile(fallback_user_id)
+        return get_default_profile(fallback_user_id)
 
     try:
-        user_id = int(selector)
+        profile_id = int(selector)
     except (TypeError, ValueError):
         return db_one(
             """
@@ -173,14 +270,14 @@ def get_profile_by_selector(selector: str | None, fallback_user_id: int):
             """,
             (selector,),
         )
-    return get_profile(user_id)
+    return get_profile(profile_id)
 
 
 async def profile_autocomplete(interaction: discord.Interaction, current: str):
     search = f"%{current}%"
     rows = db_all(
         """
-        SELECT discord_user_id, display_name
+        SELECT id, display_name
         FROM profiles
         WHERE %s = '' OR display_name ILIKE %s
         ORDER BY display_name ASC
@@ -189,20 +286,20 @@ async def profile_autocomplete(interaction: discord.Interaction, current: str):
         (current, search),
     )
     return [
-        app_commands.Choice(name=row["display_name"][:100], value=str(row["discord_user_id"]))
+        app_commands.Choice(name=row["display_name"][:100], value=str(row["id"]))
         for row in rows
     ]
 
 
-def get_active_day(user_id: int):
+def get_active_day(profile_id: int):
     return db_one(
         """
         SELECT * FROM work_days
-        WHERE discord_user_id = %s AND status = 'active'
+        WHERE profile_id = %s AND status = 'active'
         ORDER BY started_at DESC
         LIMIT 1
         """,
-        (user_id,),
+        (profile_id,),
     )
 
 
@@ -361,6 +458,10 @@ class TaskSelect(discord.ui.Select):
 
 
 class StartDayTaskModal(discord.ui.Modal, title="Start productivity day"):
+    def __init__(self, profile_row):
+        super().__init__()
+        self.profile_row = profile_row
+
     task_list = discord.ui.TextInput(
         label="Today's tasks",
         placeholder="Write one task per line. Self-care is added automatically.",
@@ -370,14 +471,13 @@ class StartDayTaskModal(discord.ui.Modal, title="Start productivity day"):
     )
 
     async def on_submit(self, interaction: discord.Interaction):
-        if get_active_day(interaction.user.id):
+        if get_active_day(self.profile_row["id"]):
             await interaction.response.send_message(
                 embed=make_embed("Active Day", "⚠️ You already have an active day. Use `/closeday` first."),
                 ephemeral=True,
             )
             return
 
-        ensure_profile(interaction.user)
         task_names = [line.strip() for line in str(self.task_list).splitlines() if line.strip()]
         task_names = [name for name in task_names if name.lower() != SELF_CARE_TASK.lower()]
         if not task_names:
@@ -394,9 +494,8 @@ class StartDayTaskModal(discord.ui.Modal, title="Start productivity day"):
             return
 
         task_names.append(SELF_CARE_TASK)
-        day_id, started_at = create_day(interaction.user.id, task_names)
-        profile = get_profile(interaction.user.id)
-        display_name = profile["display_name"] if profile else interaction.user.display_name
+        day_id, started_at = create_day(self.profile_row["id"], self.profile_row["owner_discord_user_id"], task_names)
+        display_name = self.profile_row["display_name"]
         await interaction.response.send_message(
             embed=make_embed(
                 f"Welcome back, {display_name}",
@@ -404,7 +503,7 @@ class StartDayTaskModal(discord.ui.Modal, title="Start productivity day"):
             ),
             ephemeral=True,
         )
-        asyncio.create_task(run_checkin(interaction.user.id, "Choose what you are starting with.", started_at))
+        asyncio.create_task(run_checkin(self.profile_row["id"], "Choose what you are starting with.", started_at))
 
 
 async def ask_task_choice(user: discord.User, day_id: int, reason: str):
@@ -435,15 +534,19 @@ async def ask_task_choice(user: discord.User, day_id: int, reason: str):
     return task_rows[0]["id"], "default_first_task"
 
 
-async def run_checkin(user_id: int, reason: str, segment_started_at: dt.datetime | None = None):
-    if user_id in checkin_locks:
+async def run_checkin(profile_id: int, reason: str, segment_started_at: dt.datetime | None = None):
+    if profile_id in checkin_locks:
         return
-    checkin_locks.add(user_id)
+    checkin_locks.add(profile_id)
     try:
-        day = get_active_day(user_id)
+        day = get_active_day(profile_id)
         if not day:
             return
 
+        profile_row = get_profile(profile_id)
+        if not profile_row:
+            return
+        user_id = profile_row["owner_discord_user_id"]
         user = bot.get_user(user_id) or await bot.fetch_user(user_id)
         asked_at = utc_now()
         task_id, source = await ask_task_choice(user, day["id"], reason)
@@ -461,34 +564,34 @@ async def run_checkin(user_id: int, reason: str, segment_started_at: dt.datetime
         )
         set_next_checkin(day["id"], utc_now() + CHECKIN_INTERVAL)
     finally:
-        checkin_locks.discard(user_id)
+        checkin_locks.discard(profile_id)
 
 
 @discord_tasks.loop(minutes=1)
 async def checkin_scheduler():
     rows = db_all(
         """
-        SELECT discord_user_id
+        SELECT profile_id
         FROM work_days
-        WHERE status = 'active' AND next_checkin_at IS NOT NULL AND next_checkin_at <= %s
+        WHERE status = 'active' AND profile_id IS NOT NULL AND next_checkin_at IS NOT NULL AND next_checkin_at <= %s
         """,
         (utc_now(),),
     )
     for row in rows:
-        asyncio.create_task(run_checkin(row["discord_user_id"], "Scheduled 30-minute check-in."))
+        asyncio.create_task(run_checkin(row["profile_id"], "Scheduled 30-minute check-in."))
 
 
-def create_day(user_id: int, task_names: list[str]):
+def create_day(profile_id: int, owner_user_id: int, task_names: list[str]):
     started_at = utc_now()
     work_date = started_at.astimezone(ZoneInfo(TIMEZONE)).date()
     with get_conn().cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
             """
-            INSERT INTO work_days (discord_user_id, work_date, started_at, status)
-            VALUES (%s, %s, %s, 'active')
+            INSERT INTO work_days (profile_id, discord_user_id, work_date, started_at, status)
+            VALUES (%s, %s, %s, %s, 'active')
             RETURNING id
             """,
-            (user_id, work_date, started_at),
+            (profile_id, owner_user_id, work_date, started_at),
         )
         day_id = cur.fetchone()["id"]
         first_task_id = None
@@ -521,21 +624,21 @@ def weekly_range(anchor: dt.date):
     return start, end
 
 
-def weekly_rows(user_id: int, anchor: dt.date):
+def weekly_rows(profile_id: int, anchor: dt.date):
     start, end = weekly_range(anchor)
     return db_all(
         """
         SELECT id, work_date, started_at, closed_at, status
         FROM work_days
-        WHERE discord_user_id = %s AND work_date >= %s AND work_date < %s
+        WHERE profile_id = %s AND work_date >= %s AND work_date < %s
         ORDER BY work_date ASC, started_at ASC
         """,
-        (user_id, start, end),
+        (profile_id, start, end),
     )
 
 
-def weekly_summary(user_id: int, anchor: dt.date):
-    rows = weekly_rows(user_id, anchor)
+def weekly_summary(profile_id: int, anchor: dt.date):
+    rows = weekly_rows(profile_id, anchor)
     daily = []
     task_totals = defaultdict(dt.timedelta)
     week_total = dt.timedelta()
@@ -656,7 +759,7 @@ def make_dashboard_image(profile, daily, week_total, task_totals, anchor: dt.dat
 
     draw.text((82, 738), "Generated by the productivity tracker", font=tiny_font, fill="#597797")
 
-    output = os.path.join(tempfile.gettempdir(), f"productivity_week_{profile['discord_user_id']}_{anchor}.png")
+    output = os.path.join(tempfile.gettempdir(), f"productivity_week_{profile['id']}_{anchor}.png")
     image.save(output)
     return output
 
@@ -673,20 +776,40 @@ async def createprofile(interaction: discord.Interaction, display_name: str, cha
 
 
 @bot.tree.command(name="startday", description="Start your productivity day and send today's tasks.")
-async def startday(interaction: discord.Interaction):
-    if get_active_day(interaction.user.id):
+@app_commands.describe(profile_name="Saved bot profile to start")
+@app_commands.autocomplete(profile_name=profile_autocomplete)
+async def startday(interaction: discord.Interaction, profile_name: str | None = None):
+    profile_row = get_profile_by_selector(profile_name, interaction.user.id)
+    if not profile_row:
+        await interaction.response.send_message(
+            embed=make_embed("Profile Missing", "Create a profile first with `/createprofile`."),
+            ephemeral=True,
+        )
+        return
+
+    if get_active_day(profile_row["id"]):
         await interaction.response.send_message(
             embed=make_embed("Active Day", "⚠️ You already have an active day. Use `/closeday` first."),
             ephemeral=True,
         )
         return
 
-    await interaction.response.send_modal(StartDayTaskModal())
+    await interaction.response.send_modal(StartDayTaskModal(profile_row))
 
 
 @bot.tree.command(name="closeday", description="Close your active day and show the time spent per task.")
-async def closeday(interaction: discord.Interaction):
-    day = get_active_day(interaction.user.id)
+@app_commands.describe(profile_name="Saved bot profile to close")
+@app_commands.autocomplete(profile_name=profile_autocomplete)
+async def closeday(interaction: discord.Interaction, profile_name: str | None = None):
+    profile_row = get_profile_by_selector(profile_name, interaction.user.id)
+    if not profile_row:
+        await interaction.response.send_message(
+            embed=make_embed("Profile Missing", "Create a profile first with `/createprofile`."),
+            ephemeral=True,
+        )
+        return
+
+    day = get_active_day(profile_row["id"])
     if not day:
         await interaction.response.send_message(
             embed=make_embed("No Active Day", "⚠️ You do not have an active day."),
@@ -714,8 +837,8 @@ async def profile(interaction: discord.Interaction, profile_name: str | None = N
         return
 
     days = db_all(
-        "SELECT id, closed_at FROM work_days WHERE discord_user_id = %s AND status = 'closed'",
-        (profile_row["discord_user_id"],),
+        "SELECT id, closed_at FROM work_days WHERE profile_id = %s AND status = 'closed'",
+        (profile_row["id"],),
     )
     total = dt.timedelta()
     for row in days:
@@ -759,7 +882,7 @@ async def weekly(
         return
 
     selected_mode = mode.value if mode else "overview"
-    daily, week_total, task_totals = weekly_summary(profile_row["discord_user_id"], anchor)
+    daily, week_total, task_totals = weekly_summary(profile_row["id"], anchor)
     if selected_mode == "image":
         path = make_dashboard_image(profile_row, daily, week_total, task_totals, anchor)
         await interaction.followup.send(file=discord.File(path, filename="weekly-productivity.png"))
@@ -801,11 +924,11 @@ async def daystats(interaction: discord.Interaction, profile_name: str | None = 
         """
         SELECT id, closed_at
         FROM work_days
-        WHERE discord_user_id = %s AND work_date = %s
+        WHERE profile_id = %s AND work_date = %s
         ORDER BY started_at DESC
         LIMIT 1
         """,
-        (profile_row["discord_user_id"], work_date),
+        (profile_row["id"], work_date),
     )
     if not row:
         await interaction.response.send_message(embed=make_embed("No Day Found", "📭 No day found for that date."), ephemeral=True)
@@ -842,7 +965,8 @@ async def test(interaction: discord.Interaction, option: app_commands.Choice[str
         return
 
     if option.value == "checkin":
-        if not get_active_day(interaction.user.id):
+        profile_row = get_default_profile(interaction.user.id)
+        if not profile_row or not get_active_day(profile_row["id"]):
             await interaction.response.send_message(
                 embed=make_embed("No Active Day", "⚠️ Start a day first with `/startday`."),
                 ephemeral=True,
@@ -852,11 +976,12 @@ async def test(interaction: discord.Interaction, option: app_commands.Choice[str
             embed=make_embed("Check-in Test", "📩 Sending a test check-in to your DMs."),
             ephemeral=True,
         )
-        await run_checkin(interaction.user.id, "Manual test check-in.")
+        await run_checkin(profile_row["id"], "Manual test check-in.")
         return
 
     if option.value == "closeday":
-        day = get_active_day(interaction.user.id)
+        profile_row = get_default_profile(interaction.user.id)
+        day = get_active_day(profile_row["id"]) if profile_row else None
         if not day:
             await interaction.response.send_message(
                 embed=make_embed("No Active Day", "⚠️ No active day to preview."),
@@ -872,11 +997,10 @@ async def test(interaction: discord.Interaction, option: app_commands.Choice[str
 
 async def send_weekly_graph_test(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    profile_row = get_profile(interaction.user.id)
+    profile_row = get_default_profile(interaction.user.id)
     if not profile_row:
-        ensure_profile(interaction.user)
-        profile_row = get_profile(interaction.user.id)
-    daily, week_total, task_totals = weekly_summary(interaction.user.id, local_now().date())
+        profile_row = ensure_profile(interaction.user)
+    daily, week_total, task_totals = weekly_summary(profile_row["id"], local_now().date())
     path = make_dashboard_image(profile_row, daily, week_total, task_totals, local_now().date())
     await interaction.followup.send(file=discord.File(path, filename="weekly-productivity-test.png"), ephemeral=True)
 
