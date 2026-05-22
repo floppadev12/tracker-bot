@@ -1,2431 +1,715 @@
+import asyncio
+import datetime as dt
 import os
-import re
-from datetime import datetime, timezone
-from typing import Optional, List
+import tempfile
+from collections import defaultdict
+from zoneinfo import ZoneInfo
 
-import asyncpg
 import discord
-from discord.ext import commands
+import psycopg2
+import psycopg2.extras
+from discord import app_commands
+from discord.ext import commands, tasks as discord_tasks
 from dotenv import load_dotenv
+from PIL import Image, ImageDraw, ImageFont
+
 
 load_dotenv()
 
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID")
+TOKEN = os.getenv("DISCORD_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-MAINTENANCE_ROLE_ID = os.getenv("MAINTENANCE_ROLE_ID")
 
-if not DISCORD_TOKEN:
-    raise RuntimeError("Missing DISCORD_TOKEN")
-if not DISCORD_GUILD_ID:
-    raise RuntimeError("Missing DISCORD_GUILD_ID")
-if not DATABASE_URL:
-    raise RuntimeError("Missing DATABASE_URL")
-if not MAINTENANCE_ROLE_ID:
-    raise RuntimeError("Missing MAINTENANCE_ROLE_ID")
+# Preserved settings from the previous bot.
+PROJECT_NAME = "Project Floppa"
+REPORT_CHANNEL_ID = 1490317756136947942
+TIMEZONE = "Europe/Bratislava"
+USD_PER_ROBUX = 0.0038
+EMBED_COLOR = discord.Color.from_rgb(255, 255, 255)
 
-GUILD_ID = int(DISCORD_GUILD_ID)
-MAINTENANCE_ROLE_ID = int(MAINTENANCE_ROLE_ID)
-
-EMBED_COLOR = discord.Color(0xFFC78A)
+ROLE_NAME = "Executive"
+SELF_CARE_TASK = "Self-care"
+CHECKIN_INTERVAL = dt.timedelta(minutes=30)
+CHECKIN_RETRY_DELAYS = (60, 10, 10, 10)
+MAX_CUSTOM_TASKS = 24
 
 intents = discord.Intents.default()
+intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
-tree = bot.tree
-db_pool: Optional[asyncpg.Pool] = None
 
-
-# -----------------------------
-# Utilities
-# -----------------------------
-def parse_duration(text: str) -> Optional[int]:
-    text = text.strip().lower()
-    match = re.fullmatch(r"\s*(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*", text)
-    if not match:
-        return None
-
-    hours = int(match.group(1) or 0)
-    minutes = int(match.group(2) or 0)
-    total = hours * 60 + minutes
-    return total if total > 0 else None
-
-
-def format_duration(total_minutes: int) -> str:
-    total_minutes = max(0, int(total_minutes))
-    hours = total_minutes // 60
-    minutes = total_minutes % 60
-
-    if hours and minutes:
-        return f"{hours}h {minutes}m"
-    if hours:
-        return f"{hours}h"
-    return f"{minutes}m"
-
-
-def format_duration_stat(total_minutes: int) -> str:
-    total_minutes = max(0, int(total_minutes))
-    hours = total_minutes // 60
-    minutes = total_minutes % 60
-    return f"{hours}h {minutes:02d}m"
-
-
-def format_percent(won: int, missed: int) -> str:
-    total = won + missed
-    if total <= 0:
-        return "0%"
-    return f"{round((won / total) * 100)}%"
-
-
-def has_maintenance_role(interaction: discord.Interaction) -> bool:
-    if not interaction.guild or not isinstance(interaction.user, discord.Member):
-        return False
-    return any(role.id == MAINTENANCE_ROLE_ID for role in interaction.user.roles)
-
-
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-# -----------------------------
-# Database
-# -----------------------------
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS fields (
-    id SERIAL PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS formats (
-    id SERIAL PRIMARY KEY,
-    field_id INTEGER NOT NULL REFERENCES fields(id) ON DELETE CASCADE,
-    name TEXT NOT NULL UNIQUE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS segments (
-    id SERIAL PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS projects (
-    id SERIAL PRIMARY KEY,
-    field_id INTEGER NOT NULL REFERENCES fields(id) ON DELETE CASCADE,
-    format_id INTEGER NOT NULL REFERENCES formats(id) ON DELETE CASCADE,
-    name TEXT NOT NULL UNIQUE,
-    status TEXT NOT NULL CHECK (status IN ('in_development', 'released', 'won', 'missed')),
-    released_at TIMESTAMPTZ NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS project_segment_hours (
-    id SERIAL PRIMARY KEY,
-    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    segment_id INTEGER NOT NULL REFERENCES segments(id) ON DELETE CASCADE,
-    minutes INTEGER NOT NULL DEFAULT 0,
-    UNIQUE(project_id, segment_id)
-);
-"""
-
-
-async def init_db():
-    global db_pool
-    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-    async with db_pool.acquire() as conn:
-        await conn.execute(SCHEMA_SQL)
-
-        for name in ["Build", "Script", "UI", "Thumbnail"]:
-            await conn.execute(
-                "INSERT INTO segments (name) VALUES ($1) ON CONFLICT (name) DO NOTHING",
-                name,
-            )
-
-
-async def fetch_fields() -> List[asyncpg.Record]:
-    async with db_pool.acquire() as conn:
-        return await conn.fetch("SELECT id, name FROM fields ORDER BY name ASC")
-
-
-async def fetch_field(field_id: int) -> Optional[asyncpg.Record]:
-    async with db_pool.acquire() as conn:
-        return await conn.fetchrow(
-            "SELECT id, name FROM fields WHERE id = $1",
-            field_id,
-        )
-
-
-async def fetch_formats(field_id: int) -> List[asyncpg.Record]:
-    async with db_pool.acquire() as conn:
-        return await conn.fetch(
-            "SELECT id, name FROM formats WHERE field_id = $1 ORDER BY name ASC",
-            field_id,
-        )
-
-
-async def fetch_format(format_id: int) -> Optional[asyncpg.Record]:
-    async with db_pool.acquire() as conn:
-        return await conn.fetchrow(
-            "SELECT id, field_id, name FROM formats WHERE id = $1",
-            format_id,
-        )
-
-
-async def fetch_segments() -> List[asyncpg.Record]:
-    async with db_pool.acquire() as conn:
-        return await conn.fetch("SELECT id, name FROM segments ORDER BY name ASC")
-
-
-async def fetch_projects(field_id: int, format_id: int) -> List[asyncpg.Record]:
-    async with db_pool.acquire() as conn:
-        return await conn.fetch(
-            """
-            SELECT id, name, status
-            FROM projects
-            WHERE field_id = $1 AND format_id = $2
-            ORDER BY name ASC
-            """,
-            field_id,
-            format_id,
-        )
-
-
-async def fetch_project(project_id: int) -> Optional[asyncpg.Record]:
-    async with db_pool.acquire() as conn:
-        return await conn.fetchrow(
-            """
-            SELECT
-                p.id,
-                p.name,
-                p.status,
-                p.released_at,
-                f.name AS field_name,
-                fm.name AS format_name,
-                p.field_id,
-                p.format_id
-            FROM projects p
-            JOIN fields f ON f.id = p.field_id
-            JOIN formats fm ON fm.id = p.format_id
-            WHERE p.id = $1
-            """,
-            project_id,
-        )
-
-
-async def fetch_project_by_name(name: str) -> Optional[asyncpg.Record]:
-    async with db_pool.acquire() as conn:
-        return await conn.fetchrow(
-            "SELECT id, name FROM projects WHERE LOWER(name) = LOWER($1)",
-            name,
-        )
-
-
-async def fetch_project_segment_rows(project_id: int) -> List[asyncpg.Record]:
-    async with db_pool.acquire() as conn:
-        return await conn.fetch(
-            """
-            SELECT
-                s.id AS segment_id,
-                s.name AS segment_name,
-                COALESCE(psh.minutes, 0) AS minutes
-            FROM segments s
-            LEFT JOIN project_segment_hours psh
-                ON psh.segment_id = s.id
-               AND psh.project_id = $1
-            ORDER BY s.name ASC
-            """,
-            project_id,
-        )
-
-
-async def create_project(field_id: int, format_id: int, name: str) -> Optional[int]:
-    async with db_pool.acquire() as conn:
-        try:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO projects (field_id, format_id, name, status)
-                VALUES ($1, $2, $3, 'in_development')
-                RETURNING id
-                """,
-                field_id,
-                format_id,
-                name,
-            )
-            return row["id"]
-        except asyncpg.UniqueViolationError:
-            return None
-
-
-async def add_project_minutes(project_id: int, segment_id: int, minutes: int):
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO project_segment_hours (project_id, segment_id, minutes)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (project_id, segment_id)
-            DO UPDATE SET minutes = project_segment_hours.minutes + EXCLUDED.minutes
-            """,
-            project_id,
-            segment_id,
-            minutes,
-        )
-        await conn.execute(
-            "UPDATE projects SET updated_at = NOW() WHERE id = $1",
-            project_id,
-        )
-
-
-async def set_project_minutes(project_id: int, segment_id: int, minutes: int):
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO project_segment_hours (project_id, segment_id, minutes)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (project_id, segment_id)
-            DO UPDATE SET minutes = EXCLUDED.minutes
-            """,
-            project_id,
-            segment_id,
-            minutes,
-        )
-        await conn.execute(
-            "UPDATE projects SET updated_at = NOW() WHERE id = $1",
-            project_id,
-        )
-
-
-async def release_project(project_id: int):
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE projects
-            SET status = 'released',
-                released_at = NOW(),
-                updated_at = NOW()
-            WHERE id = $1
-            """,
-            project_id,
-        )
-
-
-async def set_project_status(project_id: int, status: str):
-    async with db_pool.acquire() as conn:
-        if status == "released":
-            await conn.execute(
-                """
-                UPDATE projects
-                SET status = 'released',
-                    released_at = COALESCE(released_at, NOW()),
-                    updated_at = NOW()
-                WHERE id = $1
-                """,
-                project_id,
-            )
-        elif status == "in_development":
-            await conn.execute(
-                """
-                UPDATE projects
-                SET status = 'in_development',
-                    released_at = NULL,
-                    updated_at = NOW()
-                WHERE id = $1
-                """,
-                project_id,
-            )
-        else:
-            await conn.execute(
-                """
-                UPDATE projects
-                SET status = $2,
-                    updated_at = NOW()
-                WHERE id = $1
-                """,
-                project_id,
-                status,
-            )
-
-
-async def create_field(name: str) -> bool:
-    async with db_pool.acquire() as conn:
-        try:
-            await conn.execute("INSERT INTO fields (name) VALUES ($1)", name)
-            return True
-        except asyncpg.UniqueViolationError:
-            return False
-
-
-async def delete_field(field_id: int):
-    async with db_pool.acquire() as conn:
-        await conn.execute("DELETE FROM fields WHERE id = $1", field_id)
-
-
-async def create_format(field_id: int, name: str) -> bool:
-    async with db_pool.acquire() as conn:
-        try:
-            await conn.execute(
-                "INSERT INTO formats (field_id, name) VALUES ($1, $2)",
-                field_id,
-                name,
-            )
-            return True
-        except asyncpg.UniqueViolationError:
-            return False
-
-
-async def delete_format(format_id: int):
-    async with db_pool.acquire() as conn:
-        await conn.execute("DELETE FROM formats WHERE id = $1", format_id)
-
-
-async def create_segment(name: str) -> bool:
-    async with db_pool.acquire() as conn:
-        try:
-            await conn.execute("INSERT INTO segments (name) VALUES ($1)", name)
-            return True
-        except asyncpg.UniqueViolationError:
-            return False
-
-
-async def delete_segment(segment_id: int):
-    async with db_pool.acquire() as conn:
-        await conn.execute("DELETE FROM segments WHERE id = $1", segment_id)
-
-
-async def rename_project(project_id: int, new_name: str) -> bool:
-    async with db_pool.acquire() as conn:
-        try:
-            await conn.execute(
-                """
-                UPDATE projects
-                SET name = $2, updated_at = NOW()
-                WHERE id = $1
-                """,
-                project_id,
-                new_name,
-            )
-            return True
-        except asyncpg.UniqueViolationError:
-            return False
-
-
-async def move_project(project_id: int, field_id: int, format_id: int):
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE projects
-            SET field_id = $2, format_id = $3, updated_at = NOW()
-            WHERE id = $1
-            """,
-            project_id,
-            field_id,
-            format_id,
-        )
-
-
-async def delete_project(project_id: int):
-    async with db_pool.acquire() as conn:
-        await conn.execute("DELETE FROM projects WHERE id = $1", project_id)
-
-
-async def fetch_winrate_overall():
-    async with db_pool.acquire() as conn:
-        return await conn.fetchrow(
-            """
-            SELECT
-                COUNT(*) FILTER (WHERE status = 'won') AS won,
-                COUNT(*) FILTER (WHERE status = 'missed') AS missed
-            FROM projects
-            WHERE status IN ('won', 'missed')
-            """
-        )
-
-
-async def fetch_winrate_by_field(field_id: int):
-    async with db_pool.acquire() as conn:
-        return await conn.fetchrow(
-            """
-            SELECT
-                COUNT(*) FILTER (WHERE status = 'won') AS won,
-                COUNT(*) FILTER (WHERE status = 'missed') AS missed
-            FROM projects
-            WHERE field_id = $1
-              AND status IN ('won', 'missed')
-            """,
-            field_id,
-        )
-
-
-async def fetch_winrate_by_format(format_id: int):
-    async with db_pool.acquire() as conn:
-        return await conn.fetchrow(
-            """
-            SELECT
-                COUNT(*) FILTER (WHERE status = 'won') AS won,
-                COUNT(*) FILTER (WHERE status = 'missed') AS missed
-            FROM projects
-            WHERE format_id = $1
-              AND status IN ('won', 'missed')
-            """,
-            format_id,
-        )
-
-
-async def fetch_won_project_totals_by_format(format_id: int) -> List[asyncpg.Record]:
-    async with db_pool.acquire() as conn:
-        return await conn.fetch(
-            """
-            SELECT
-                p.id,
-                p.name,
-                COALESCE(SUM(psh.minutes), 0) AS total_minutes
-            FROM projects p
-            LEFT JOIN project_segment_hours psh
-                ON psh.project_id = p.id
-            WHERE p.format_id = $1
-              AND p.status = 'won'
-            GROUP BY p.id, p.name
-            ORDER BY total_minutes DESC, p.name ASC
-            """,
-            format_id,
-        )
-
-
-async def fetch_won_format_totals_by_field(field_id: int) -> List[asyncpg.Record]:
-    async with db_pool.acquire() as conn:
-        return await conn.fetch(
-            """
-            SELECT
-                fm.id,
-                fm.name,
-                COALESCE(SUM(psh.minutes), 0) AS total_minutes
-            FROM formats fm
-            LEFT JOIN projects p
-                ON p.format_id = fm.id
-               AND p.status = 'won'
-            LEFT JOIN project_segment_hours psh
-                ON psh.project_id = p.id
-            WHERE fm.field_id = $1
-            GROUP BY fm.id, fm.name
-            HAVING COUNT(p.id) > 0
-            ORDER BY total_minutes DESC, fm.name ASC
-            """,
-            field_id,
-        )
-
-
-async def fetch_field_leaderboard_rows() -> List[asyncpg.Record]:
-    async with db_pool.acquire() as conn:
-        return await conn.fetch(
-            """
-            WITH project_totals AS (
-                SELECT
-                    p.id AS project_id,
-                    p.field_id,
-                    p.status,
-                    COALESCE(SUM(psh.minutes), 0) AS total_minutes
-                FROM projects p
-                LEFT JOIN project_segment_hours psh
-                    ON psh.project_id = p.id
-                WHERE p.status IN ('won', 'missed')
-                GROUP BY p.id, p.field_id, p.status
-            )
-            SELECT
-                f.id,
-                f.name,
-                COUNT(*) FILTER (WHERE pt.status = 'won') AS won,
-                COUNT(*) FILTER (WHERE pt.status = 'missed') AS missed,
-                COUNT(pt.project_id) AS finished_count,
-                COALESCE(SUM(pt.total_minutes), 0) AS total_minutes_finished,
-                CASE
-                    WHEN COUNT(pt.project_id) > 0
-                    THEN COALESCE(SUM(pt.total_minutes), 0)::FLOAT / COUNT(pt.project_id)
-                    ELSE 0
-                END AS avg_minutes
-            FROM fields f
-            LEFT JOIN project_totals pt
-                ON pt.field_id = f.id
-            GROUP BY f.id, f.name
-            HAVING COUNT(pt.project_id) > 0
-            ORDER BY
-                (COUNT(*) FILTER (WHERE pt.status = 'won'))::FLOAT / NULLIF(COUNT(pt.project_id), 0) DESC,
-                CASE
-                    WHEN COUNT(pt.project_id) > 0
-                    THEN COALESCE(SUM(pt.total_minutes), 0)::FLOAT / COUNT(pt.project_id)
-                    ELSE 0
-                END ASC,
-                COUNT(pt.project_id) DESC,
-                f.name ASC
-            """
-        )
-
-
-async def fetch_format_leaderboard_rows() -> List[asyncpg.Record]:
-    async with db_pool.acquire() as conn:
-        return await conn.fetch(
-            """
-            WITH project_totals AS (
-                SELECT
-                    p.id AS project_id,
-                    p.format_id,
-                    p.status,
-                    COALESCE(SUM(psh.minutes), 0) AS total_minutes
-                FROM projects p
-                LEFT JOIN project_segment_hours psh
-                    ON psh.project_id = p.id
-                WHERE p.status IN ('won', 'missed')
-                GROUP BY p.id, p.format_id, p.status
-            )
-            SELECT
-                fm.id,
-                fm.name,
-                COUNT(*) FILTER (WHERE pt.status = 'won') AS won,
-                COUNT(*) FILTER (WHERE pt.status = 'missed') AS missed,
-                COUNT(pt.project_id) AS finished_count,
-                COALESCE(SUM(pt.total_minutes), 0) AS total_minutes_finished,
-                CASE
-                    WHEN COUNT(pt.project_id) > 0
-                    THEN COALESCE(SUM(pt.total_minutes), 0)::FLOAT / COUNT(pt.project_id)
-                    ELSE 0
-                END AS avg_minutes
-            FROM formats fm
-            LEFT JOIN project_totals pt
-                ON pt.format_id = fm.id
-            GROUP BY fm.id, fm.name
-            HAVING COUNT(pt.project_id) > 0
-            ORDER BY
-                (COUNT(*) FILTER (WHERE pt.status = 'won'))::FLOAT / NULLIF(COUNT(pt.project_id), 0) DESC,
-                CASE
-                    WHEN COUNT(pt.project_id) > 0
-                    THEN COALESCE(SUM(pt.total_minutes), 0)::FLOAT / COUNT(pt.project_id)
-                    ELSE 0
-                END ASC,
-                COUNT(pt.project_id) DESC,
-                fm.name ASC
-            """
-        )
-
-
-async def fetch_format_leaderboard_rows_by_field(field_id: int) -> List[asyncpg.Record]:
-    async with db_pool.acquire() as conn:
-        return await conn.fetch(
-            """
-            WITH project_totals AS (
-                SELECT
-                    p.id AS project_id,
-                    p.field_id,
-                    p.format_id,
-                    p.status,
-                    COALESCE(SUM(psh.minutes), 0) AS total_minutes
-                FROM projects p
-                LEFT JOIN project_segment_hours psh
-                    ON psh.project_id = p.id
-                WHERE p.status IN ('won', 'missed')
-                  AND p.field_id = $1
-                GROUP BY p.id, p.field_id, p.format_id, p.status
-            )
-            SELECT
-                fm.id,
-                fm.name,
-                COUNT(*) FILTER (WHERE pt.status = 'won') AS won,
-                COUNT(*) FILTER (WHERE pt.status = 'missed') AS missed,
-                COUNT(pt.project_id) AS finished_count,
-                COALESCE(SUM(pt.total_minutes), 0) AS total_minutes_finished,
-                CASE
-                    WHEN COUNT(pt.project_id) > 0
-                    THEN COALESCE(SUM(pt.total_minutes), 0)::FLOAT / COUNT(pt.project_id)
-                    ELSE 0
-                END AS avg_minutes
-            FROM formats fm
-            LEFT JOIN project_totals pt
-                ON pt.format_id = fm.id
-            WHERE fm.field_id = $1
-            GROUP BY fm.id, fm.name
-            HAVING COUNT(pt.project_id) > 0
-            ORDER BY
-                (COUNT(*) FILTER (WHERE pt.status = 'won'))::FLOAT / NULLIF(COUNT(pt.project_id), 0) DESC,
-                CASE
-                    WHEN COUNT(pt.project_id) > 0
-                    THEN COALESCE(SUM(pt.total_minutes), 0)::FLOAT / COUNT(pt.project_id)
-                    ELSE 0
-                END ASC,
-                COUNT(pt.project_id) DESC,
-                fm.name ASC
-            """,
-            field_id,
-        )
-
-
-# -----------------------------
-# Embed builders
-# -----------------------------
-def build_home_embed() -> discord.Embed:
-    embed = discord.Embed(
-        title="Project Assistant",
-        description="Hi, I’m **Nova**! How can I help with your **projects** today? 👋",
-        color=EMBED_COLOR,
-        timestamp=utcnow(),
-    )
-    return embed
-
-
-def build_project_embed(project: asyncpg.Record, segment_rows: List[asyncpg.Record]) -> discord.Embed:
-    status_map = {
-        "in_development": "🛠️ In Development",
-        "released": "🚀 Released",
-        "won": "🏆 Won",
-        "missed": "🗑️ Missed",
-    }
-
-    total_minutes = sum(int(row["minutes"]) for row in segment_rows)
-    hours_text = "\n".join(
-        f"**{row['segment_name']}** — {format_duration(int(row['minutes']))}"
-        for row in segment_rows
-    ) or "No hours added yet."
-
-    release_date = "Not released yet"
-    if project["released_at"]:
-        release_dt = project["released_at"]
-        if release_dt.tzinfo is None:
-            release_dt = release_dt.replace(tzinfo=timezone.utc)
-        release_date = discord.utils.format_dt(release_dt, style="F")
-
-    embed = discord.Embed(
-        title=f"{project['name']}",
-        color=EMBED_COLOR,
-        timestamp=utcnow(),
+conn = None
+checkin_locks = set()
+
+
+def utc_now():
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def local_now():
+    return utc_now().astimezone(ZoneInfo(TIMEZONE))
+
+
+def parse_local_date(value: str | None):
+    if not value:
+        return local_now().date()
+    try:
+        return dt.date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError("Use date format YYYY-MM-DD.") from exc
+
+
+def get_conn():
+    global conn
+    if conn is None or conn.closed:
+        if not DATABASE_URL:
+            raise RuntimeError("DATABASE_URL is missing.")
+        conn = psycopg2.connect(DATABASE_URL)
+        conn.autocommit = True
+    return conn
+
+
+def db_one(query, params=()):
+    with get_conn().cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(query, params)
+        return cur.fetchone()
+
+
+def db_all(query, params=()):
+    with get_conn().cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(query, params)
+        return cur.fetchall()
+
+
+def db_exec(query, params=()):
+    with get_conn().cursor() as cur:
+        cur.execute(query, params)
+
+
+def init_db():
+    db_exec(
+        """
+        CREATE TABLE IF NOT EXISTS profiles (
+            discord_user_id BIGINT PRIMARY KEY,
+            display_name TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'Executive',
+            channel_id BIGINT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS work_days (
+            id SERIAL PRIMARY KEY,
+            discord_user_id BIGINT NOT NULL REFERENCES profiles(discord_user_id),
+            work_date DATE NOT NULL,
+            started_at TIMESTAMPTZ NOT NULL,
+            closed_at TIMESTAMPTZ,
+            status TEXT NOT NULL DEFAULT 'active',
+            next_checkin_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS day_tasks (
+            id SERIAL PRIMARY KEY,
+            day_id INTEGER NOT NULL REFERENCES work_days(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            sort_order INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS task_segments (
+            id SERIAL PRIMARY KEY,
+            day_id INTEGER NOT NULL REFERENCES work_days(id) ON DELETE CASCADE,
+            task_id INTEGER NOT NULL REFERENCES day_tasks(id),
+            started_at TIMESTAMPTZ NOT NULL,
+            ended_at TIMESTAMPTZ,
+            source TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS checkins (
+            id SERIAL PRIMARY KEY,
+            day_id INTEGER NOT NULL REFERENCES work_days(id) ON DELETE CASCADE,
+            task_id INTEGER REFERENCES day_tasks(id),
+            asked_at TIMESTAMPTZ NOT NULL,
+            answered_at TIMESTAMPTZ,
+            source TEXT NOT NULL
+        );
+        """
     )
 
-    embed.add_field(name="📁 Field", value=project["field_name"], inline=True)
-    embed.add_field(name="🧩 Format", value=project["format_name"], inline=True)
-    embed.add_field(name="📌 Status", value=status_map.get(project["status"], project["status"]), inline=True)
 
-    embed.add_field(name="⏱️ Hours by Segment", value=hours_text, inline=False)
-    embed.add_field(name="🕒 Total Hours", value=format_duration(total_minutes), inline=True)
-    embed.add_field(name="📅 Release Date", value=release_date, inline=True)
-
-    return embed
-
-
-def build_winrate_embed(title: str, won: int, missed: int) -> discord.Embed:
-    total = won + missed
-    winrate = (won / total * 100) if total > 0 else 0.0
-
-    embed = discord.Embed(
-        title=f"📈 {title}",
-        description="Winrate is calculated only from projects marked as **Won** or **Missed**.",
-        color=EMBED_COLOR,
-        timestamp=utcnow(),
+def ensure_profile(user: discord.abc.User, display_name=None, channel_id=None):
+    name = display_name or user.display_name
+    db_exec(
+        """
+        INSERT INTO profiles (discord_user_id, display_name, role, channel_id)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (discord_user_id)
+        DO UPDATE SET
+            display_name = EXCLUDED.display_name,
+            role = EXCLUDED.role,
+            channel_id = COALESCE(EXCLUDED.channel_id, profiles.channel_id)
+        """,
+        (user.id, name, ROLE_NAME, channel_id),
     )
-    embed.add_field(name="🏆 Won", value=str(won), inline=True)
-    embed.add_field(name="🗑️ Missed", value=str(missed), inline=True)
-    embed.add_field(name="📦 Counted", value=str(total), inline=True)
-    embed.add_field(name="📊 Winrate", value=f"**{winrate:.1f}%**", inline=False)
-    return embed
 
 
-def build_edit_embed() -> discord.Embed:
-    embed = discord.Embed(
-        title="🛠️ Edit Panel",
-        description=(
-            "Manage fields, formats, segments, and project corrections.\n\n"
-            "Choose an action from the menu below."
-        ),
-        color=EMBED_COLOR,
-        timestamp=utcnow(),
+def get_profile(user_id: int):
+    return db_one("SELECT * FROM profiles WHERE discord_user_id = %s", (user_id,))
+
+
+def get_active_day(user_id: int):
+    return db_one(
+        """
+        SELECT * FROM work_days
+        WHERE discord_user_id = %s AND status = 'active'
+        ORDER BY started_at DESC
+        LIMIT 1
+        """,
+        (user_id,),
     )
-    embed.add_field(
-        name="Actions",
-        value=(
-            "• Add/Delete Fields\n"
-            "• Add/Delete Formats\n"
-            "• Add/Delete Segments\n"
-            "• Rename Projects\n"
-            "• Move Projects\n"
-            "• Delete Projects\n"
-            "• Change Status\n"
-            "• Reopen Released Projects\n"
-            "• Set Segment Hours"
-        ),
-        inline=False,
+
+
+def get_day_tasks(day_id: int):
+    return db_all(
+        "SELECT * FROM day_tasks WHERE day_id = %s ORDER BY sort_order ASC",
+        (day_id,),
     )
-    return embed
 
 
-def build_summary_menu_embed() -> discord.Embed:
-    embed = discord.Embed(
-        title="📊 Summary Panel",
-        description="Choose whether you want a **Field** summary or a **Format** summary.",
-        color=EMBED_COLOR,
-        timestamp=utcnow(),
+def get_open_segment(day_id: int):
+    return db_one(
+        """
+        SELECT s.*, t.name AS task_name
+        FROM task_segments s
+        JOIN day_tasks t ON t.id = s.task_id
+        WHERE s.day_id = %s AND s.ended_at IS NULL
+        ORDER BY s.started_at DESC
+        LIMIT 1
+        """,
+        (day_id,),
     )
-    return embed
 
 
-def build_format_summary_embed(format_name: str, project_rows: List[asyncpg.Record], won: int, missed: int) -> discord.Embed:
-    if not project_rows:
-        description = "No won projects yet."
-    else:
-        lines = [
-            f"**{index}. {row['name']}** — {format_duration_stat(int(row['total_minutes'] or 0))}"
-            for index, row in enumerate(project_rows, start=1)
-        ]
-        description = "\n".join(lines)
-
-    description += f"\n\n**WR:** {format_percent(won, missed)} ✅"
-
-    embed = discord.Embed(
-        title=f"📦 Format Summary — {format_name}",
-        description=description,
-        color=EMBED_COLOR,
-        timestamp=utcnow(),
+def set_next_checkin(day_id: int, when: dt.datetime):
+    db_exec(
+        "UPDATE work_days SET next_checkin_at = %s WHERE id = %s",
+        (when, day_id),
     )
-    return embed
 
 
-def build_field_summary_embed(field_name: str, format_rows: List[asyncpg.Record], won: int, missed: int) -> discord.Embed:
-    if not format_rows:
-        description = "No won projects yet."
-    else:
-        lines = [
-            f"**{index}. {row['name']}** — {format_duration_stat(int(row['total_minutes'] or 0))}"
-            for index, row in enumerate(format_rows, start=1)
-        ]
-        description = "\n".join(lines)
+def switch_task(day_id: int, task_id: int, when: dt.datetime, source: str):
+    current = get_open_segment(day_id)
+    if current and current["task_id"] == task_id:
+        return
 
-    description += f"\n\n**WR:** {format_percent(won, missed)} ✅"
-
-    embed = discord.Embed(
-        title=f"📁 Field Summary — {field_name}",
-        description=description,
-        color=EMBED_COLOR,
-        timestamp=utcnow(),
+    db_exec(
+        """
+        UPDATE task_segments
+        SET ended_at = %s
+        WHERE day_id = %s AND ended_at IS NULL
+        """,
+        (when, day_id),
     )
-    return embed
-
-
-def build_lead_embed(rows: List[asyncpg.Record], title: str = "Field Leaderboard") -> discord.Embed:
-    if not rows:
-        description = "No finished projects yet."
-    else:
-        medal_map = {
-            1: "🏅",
-            2: "🥈",
-            3: "🥉",
-        }
-
-        lines = []
-        for index, row in enumerate(rows, start=1):
-            won = int(row["won"] or 0)
-            missed = int(row["missed"] or 0)
-            avg_minutes = int(round(float(row["avg_minutes"] or 0)))
-
-            medal = medal_map.get(index, "")
-            prefix = f"{index}. {medal}".strip()
-
-            lines.append(
-                f"{prefix} **{row['name']} | WR: {format_percent(won, missed)} ✅** | "
-                f"AVG HS: {format_duration_stat(avg_minutes)} 📦"
-            )
-
-        description = "\n".join(lines)
-
-    embed = discord.Embed(
-        title=title,
-        description=description,
-        color=EMBED_COLOR,
-        timestamp=utcnow(),
+    db_exec(
+        """
+        INSERT INTO task_segments (day_id, task_id, started_at, source)
+        VALUES (%s, %s, %s, %s)
+        """,
+        (day_id, task_id, when, source),
     )
-    return embed
 
 
-# -----------------------------
-# Dynamic project action view
-# -----------------------------
-class ProjectActionView(discord.ui.View):
-    def __init__(self, project_id: int, status: str):
-        super().__init__(timeout=300)
-        self.project_id = project_id
+def day_summary(day_id: int, end_at=None):
+    end_at = end_at or utc_now()
+    rows = db_all(
+        """
+        SELECT t.name, s.started_at, COALESCE(s.ended_at, %s) AS ended_at
+        FROM task_segments s
+        JOIN day_tasks t ON t.id = s.task_id
+        WHERE s.day_id = %s
+        ORDER BY s.started_at ASC
+        """,
+        (end_at, day_id),
+    )
 
-        if status == "in_development":
-            self.add_item(ReleaseButton(project_id))
-        elif status == "released":
-            self.add_item(WonButton(project_id))
-            self.add_item(MissedButton(project_id))
-
-
-class ReleaseButton(discord.ui.Button):
-    def __init__(self, project_id: int):
-        super().__init__(label="Release", emoji="🚀", style=discord.ButtonStyle.primary)
-        self.project_id = project_id
-
-    async def callback(self, interaction: discord.Interaction):
-        project = await fetch_project(self.project_id)
-        if not project:
-            return await interaction.response.send_message("Project not found.", ephemeral=True)
-        if project["status"] != "in_development":
-            return await interaction.response.send_message("This project can no longer be released.", ephemeral=True)
-
-        await interaction.response.send_modal(ConfirmStatusModal(self.project_id, "released"))
+    totals = defaultdict(dt.timedelta)
+    total = dt.timedelta()
+    for row in rows:
+        duration = row["ended_at"] - row["started_at"]
+        if duration.total_seconds() > 0:
+            totals[row["name"]] += duration
+            total += duration
+    return total, dict(totals)
 
 
-class WonButton(discord.ui.Button):
-    def __init__(self, project_id: int):
-        super().__init__(label="Won", emoji="🏆", style=discord.ButtonStyle.success)
-        self.project_id = project_id
-
-    async def callback(self, interaction: discord.Interaction):
-        project = await fetch_project(self.project_id)
-        if not project:
-            return await interaction.response.send_message("Project not found.", ephemeral=True)
-        if project["status"] != "released":
-            return await interaction.response.send_message("Only released projects can be marked as Won.", ephemeral=True)
-
-        await interaction.response.send_modal(ConfirmStatusModal(self.project_id, "won"))
+def format_duration(duration: dt.timedelta):
+    seconds = max(0, int(duration.total_seconds()))
+    hours, rem = divmod(seconds, 3600)
+    minutes = rem // 60
+    return f"{hours}h {minutes}m"
 
 
-class MissedButton(discord.ui.Button):
-    def __init__(self, project_id: int):
-        super().__init__(label="Missed", emoji="🗑️", style=discord.ButtonStyle.danger)
-        self.project_id = project_id
+def build_summary_text(title: str, total: dt.timedelta, totals: dict[str, dt.timedelta]):
+    lines = [f"**{title}**", f"Total worked: **{format_duration(total)}**", ""]
+    if not totals:
+        lines.append("No tracked time yet.")
+        return "\n".join(lines)
 
-    async def callback(self, interaction: discord.Interaction):
-        project = await fetch_project(self.project_id)
-        if not project:
-            return await interaction.response.send_message("Project not found.", ephemeral=True)
-        if project["status"] != "released":
-            return await interaction.response.send_message("Only released projects can be marked as Missed.", ephemeral=True)
-
-        await interaction.response.send_modal(ConfirmStatusModal(self.project_id, "missed"))
+    for name, duration in sorted(totals.items(), key=lambda item: item[1], reverse=True):
+        lines.append(f"- **{name}**: {format_duration(duration)}")
+    return "\n".join(lines)
 
 
-class ConfirmStatusModal(discord.ui.Modal):
-    def __init__(self, project_id: int, action: str):
-        self.project_id = project_id
-        self.action = action
-        title_map = {
-            "released": "Confirm Release",
-            "won": "Confirm Won",
-            "missed": "Confirm Missed",
-        }
-        super().__init__(title=title_map[action])
-
-        self.confirm_input = discord.ui.TextInput(
-            label="Type CONFIRM",
-            placeholder="CONFIRM",
-            required=True,
-            max_length=20
-        )
-        self.add_item(self.confirm_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        if self.confirm_input.value.strip() != "CONFIRM":
-            return await interaction.response.send_message("Confirmation failed. Type exactly `CONFIRM`.", ephemeral=True)
-
-        project = await fetch_project(self.project_id)
-        if not project:
-            return await interaction.response.send_message("Project not found.", ephemeral=True)
-
-        if self.action == "released":
-            if project["status"] != "in_development":
-                return await interaction.response.send_message("This project is no longer in development.", ephemeral=True)
-            await release_project(self.project_id)
-
-        elif self.action == "won":
-            if project["status"] != "released":
-                return await interaction.response.send_message("Only released projects can be marked as Won.", ephemeral=True)
-            await set_project_status(self.project_id, "won")
-
-        elif self.action == "missed":
-            if project["status"] != "released":
-                return await interaction.response.send_message("Only released projects can be marked as Missed.", ephemeral=True)
-            await set_project_status(self.project_id, "missed")
-
-        updated = await fetch_project(self.project_id)
-        rows = await fetch_project_segment_rows(self.project_id)
-        view = ProjectActionView(self.project_id, updated["status"])
-        await interaction.response.send_message(
-            embed=build_project_embed(updated, rows),
-            view=view,
-            ephemeral=True,
-        )
+def split_discord_messages(text: str, limit=1900):
+    chunks = []
+    current = []
+    size = 0
+    for line in text.splitlines():
+        line_size = len(line) + 1
+        if current and size + line_size > limit:
+            chunks.append("\n".join(current))
+            current = []
+            size = 0
+        current.append(line)
+        size += line_size
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
 
 
-# -----------------------------
-# /project flow
-# -----------------------------
-class ProjectHomeView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-
-    @discord.ui.button(label="Create New Project", emoji="📥", style=discord.ButtonStyle.secondary)
-    async def create_project_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        fields = await fetch_fields()
-        if not fields:
-            return await interaction.response.send_message(
-                "There are no fields yet. Ask someone with the edit role to add one.",
-                ephemeral=True,
-            )
-
-        await interaction.response.send_message(
-            "Choose a field for the new project:",
-            view=await FieldSelectView(mode="create").setup(),
-            ephemeral=True,
-        )
-
-    @discord.ui.button(label="Track Project", emoji="📂", style=discord.ButtonStyle.secondary)
-    async def track_project_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        fields = await fetch_fields()
-        if not fields:
-            return await interaction.response.send_message(
-                "There are no fields yet.",
-                ephemeral=True,
-            )
-
-        await interaction.response.send_message(
-            "Choose a field to track a project:",
-            view=await FieldSelectView(mode="track").setup(),
-            ephemeral=True,
-        )
+class TaskSelectView(discord.ui.View):
+    def __init__(self, task_rows, prompt: str):
+        super().__init__(timeout=None)
+        self.future = asyncio.get_running_loop().create_future()
+        self.add_item(TaskSelect(task_rows, prompt, self.future))
 
 
-class FieldSelect(discord.ui.Select):
-    def __init__(self, mode: str):
-        self.mode = mode
-        super().__init__(
-            placeholder="Select a field...",
-            min_values=1,
-            max_values=1,
-            options=[discord.SelectOption(label="Loading...", value="0")]
-        )
-
-    async def refresh_options(self):
-        fields = await fetch_fields()
-        self.options = [
+class TaskSelect(discord.ui.Select):
+    def __init__(self, task_rows, prompt: str, future: asyncio.Future):
+        self.future = future
+        options = [
             discord.SelectOption(label=row["name"][:100], value=str(row["id"]))
-            for row in fields[:25]
+            for row in task_rows
         ]
+        super().__init__(placeholder=prompt[:100], options=options)
 
     async def callback(self, interaction: discord.Interaction):
-        field_id = int(self.values[0])
+        if not self.future.done():
+            self.future.set_result((int(self.values[0]), interaction.created_at))
+        await interaction.response.send_message("Saved.", ephemeral=True)
+        self.view.stop()
 
-        formats = await fetch_formats(field_id)
-        if not formats:
-            return await interaction.response.send_message(
-                "This field has no formats yet.",
-                ephemeral=True,
+
+async def ask_task_choice(user: discord.User, day_id: int, reason: str):
+    task_rows = get_day_tasks(day_id)
+    if not task_rows:
+        return None, "no_tasks"
+
+    prompt = "What are you doing right now?"
+    for attempt, timeout in enumerate(CHECKIN_RETRY_DELAYS, start=1):
+        try:
+            view = TaskSelectView(task_rows, prompt)
+            await user.send(
+                f"**{PROJECT_NAME} productivity check-in**\n{reason}\nChoose your current task:",
+                view=view,
             )
+            task_id, answered_at = await asyncio.wait_for(view.future, timeout=timeout)
+            return task_id, "answered"
+        except (asyncio.TimeoutError, discord.Forbidden):
+            prompt = "Still need your current task"
+            if attempt == 1:
+                reason = "No answer yet. I will ask a few quick times before keeping your previous task."
+            else:
+                reason = "Quick retry."
 
-        await interaction.response.send_message(
-            "Choose a format:",
-            view=await FormatSelectView(mode=self.mode, field_id=field_id).setup(),
-            ephemeral=True,
-        )
-
-
-class FieldSelectView(discord.ui.View):
-    def __init__(self, mode: str):
-        super().__init__(timeout=300)
-        self.select = FieldSelect(mode)
-        self.add_item(self.select)
-
-    async def setup(self):
-        await self.select.refresh_options()
-        return self
+    previous = get_open_segment(day_id)
+    if previous:
+        return previous["task_id"], "previous_task"
+    return task_rows[0]["id"], "default_first_task"
 
 
-class FormatSelect(discord.ui.Select):
-    def __init__(self, mode: str, field_id: int):
-        self.mode = mode
-        self.field_id = field_id
-        super().__init__(
-            placeholder="Select a format...",
-            min_values=1,
-            max_values=1,
-            options=[discord.SelectOption(label="Loading...", value="0")]
-        )
-
-    async def refresh_options(self):
-        formats = await fetch_formats(self.field_id)
-        self.options = [
-            discord.SelectOption(label=row["name"][:100], value=str(row["id"]))
-            for row in formats[:25]
-        ]
-
-    async def callback(self, interaction: discord.Interaction):
-        format_id = int(self.values[0])
-
-        if self.mode == "create":
-            await interaction.response.send_modal(CreateProjectModal(self.field_id, format_id))
+async def run_checkin(user_id: int, reason: str):
+    if user_id in checkin_locks:
+        return
+    checkin_locks.add(user_id)
+    try:
+        day = get_active_day(user_id)
+        if not day:
             return
 
-        projects = await fetch_projects(self.field_id, format_id)
-        if not projects:
-            return await interaction.response.send_message(
-                "There are no projects in this format yet.",
-                ephemeral=True,
+        user = bot.get_user(user_id) or await bot.fetch_user(user_id)
+        asked_at = utc_now()
+        task_id, source = await ask_task_choice(user, day["id"], reason)
+        answered_at = utc_now() if source == "answered" else None
+        if task_id:
+            switch_task(day["id"], task_id, answered_at or utc_now(), source)
+
+        db_exec(
+            """
+            INSERT INTO checkins (day_id, task_id, asked_at, answered_at, source)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (day["id"], task_id, asked_at, answered_at, source),
+        )
+        set_next_checkin(day["id"], utc_now() + CHECKIN_INTERVAL)
+    finally:
+        checkin_locks.discard(user_id)
+
+
+@discord_tasks.loop(minutes=1)
+async def checkin_scheduler():
+    rows = db_all(
+        """
+        SELECT discord_user_id
+        FROM work_days
+        WHERE status = 'active' AND next_checkin_at IS NOT NULL AND next_checkin_at <= %s
+        """,
+        (utc_now(),),
+    )
+    for row in rows:
+        asyncio.create_task(run_checkin(row["discord_user_id"], "Scheduled 30-minute check-in."))
+
+
+def create_day(user_id: int, task_names: list[str]):
+    started_at = utc_now()
+    work_date = started_at.astimezone(ZoneInfo(TIMEZONE)).date()
+    with get_conn().cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """
+            INSERT INTO work_days (discord_user_id, work_date, started_at, status)
+            VALUES (%s, %s, %s, 'active')
+            RETURNING id
+            """,
+            (user_id, work_date, started_at),
+        )
+        day_id = cur.fetchone()["id"]
+        for index, name in enumerate(task_names, start=1):
+            cur.execute(
+                """
+                INSERT INTO day_tasks (day_id, name, sort_order)
+                VALUES (%s, %s, %s)
+                """,
+                (day_id, name, index),
             )
-
-        await interaction.response.send_message(
-            "Choose a project:",
-            view=await ProjectSelectView(self.field_id, format_id).setup(),
-            ephemeral=True,
-        )
-
-
-class FormatSelectView(discord.ui.View):
-    def __init__(self, mode: str, field_id: int):
-        super().__init__(timeout=300)
-        self.select = FormatSelect(mode, field_id)
-        self.add_item(self.select)
-
-    async def setup(self):
-        await self.select.refresh_options()
-        return self
-
-
-class CreateProjectModal(discord.ui.Modal, title="Create New Project"):
-    def __init__(self, field_id: int, format_id: int):
-        super().__init__()
-        self.field_id = field_id
-        self.format_id = format_id
-
-        self.project_name = discord.ui.TextInput(
-            label="Project Name",
-            placeholder="Example: Survive The Poppy Killer",
-            required=True,
-            max_length=100,
-        )
-        self.add_item(self.project_name)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        name = self.project_name.value.strip()
-        if not name:
-            return await interaction.response.send_message("Project name cannot be empty.", ephemeral=True)
-
-        existing = await fetch_project_by_name(name)
-        if existing:
-            return await interaction.response.send_message(
-                "A project with that name already exists.",
-                ephemeral=True,
-            )
-
-        project_id = await create_project(self.field_id, self.format_id, name)
-        if not project_id:
-            return await interaction.response.send_message(
-                "Failed to create project. That name may already exist.",
-                ephemeral=True,
-            )
-
-        project = await fetch_project(project_id)
-        rows = await fetch_project_segment_rows(project_id)
-
-        await interaction.response.send_message(
-            embed=build_project_embed(project, rows),
-            view=ProjectActionView(project_id, project["status"]),
-            ephemeral=True,
-        )
-
-
-class ProjectSelect(discord.ui.Select):
-    def __init__(self, field_id: int, format_id: int):
-        self.field_id = field_id
-        self.format_id = format_id
-        super().__init__(
-            placeholder="Select a project...",
-            min_values=1,
-            max_values=1,
-            options=[discord.SelectOption(label="Loading...", value="0")]
-        )
-
-    async def refresh_options(self):
-        projects = await fetch_projects(self.field_id, self.format_id)
-        self.options = [
-            discord.SelectOption(label=row["name"][:100], value=str(row["id"]))
-            for row in projects[:25]
-        ]
-
-    async def callback(self, interaction: discord.Interaction):
-        project_id = int(self.values[0])
-        project = await fetch_project(project_id)
-        if not project:
-            return await interaction.response.send_message("Project not found.", ephemeral=True)
-
-        rows = await fetch_project_segment_rows(project_id)
-
-        await interaction.response.send_message(
-            embed=build_project_embed(project, rows),
-            view=ProjectActionView(project_id, project["status"]),
-            ephemeral=True,
-        )
-
-
-class ProjectSelectView(discord.ui.View):
-    def __init__(self, field_id: int, format_id: int):
-        super().__init__(timeout=300)
-        self.select = ProjectSelect(field_id, format_id)
-        self.add_item(self.select)
-
-    async def setup(self):
-        await self.select.refresh_options()
-        return self
-
-
-# -----------------------------
-# /add flow
-# -----------------------------
-class AddFieldSelectView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-        self.select = AddFieldSelect()
-        self.add_item(self.select)
-
-    async def setup(self):
-        await self.select.refresh_options()
-        return self
-
-
-class AddFieldSelect(discord.ui.Select):
-    def __init__(self):
-        super().__init__(
-            placeholder="Select a field...",
-            min_values=1,
-            max_values=1,
-            options=[discord.SelectOption(label="Loading...", value="0")]
-        )
-
-    async def refresh_options(self):
-        rows = await fetch_fields()
-        self.options = [discord.SelectOption(label=r["name"][:100], value=str(r["id"])) for r in rows[:25]]
-
-    async def callback(self, interaction: discord.Interaction):
-        field_id = int(self.values[0])
-        formats = await fetch_formats(field_id)
-        if not formats:
-            return await interaction.response.send_message("This field has no formats.", ephemeral=True)
-
-        await interaction.response.send_message(
-            "Choose a format:",
-            view=await AddFormatSelectView(field_id).setup(),
-            ephemeral=True,
-        )
-
-
-class AddFormatSelectView(discord.ui.View):
-    def __init__(self, field_id: int):
-        super().__init__(timeout=300)
-        self.select = AddFormatSelect(field_id)
-        self.add_item(self.select)
-
-    async def setup(self):
-        await self.select.refresh_options()
-        return self
-
-
-class AddFormatSelect(discord.ui.Select):
-    def __init__(self, field_id: int):
-        self.field_id = field_id
-        super().__init__(
-            placeholder="Select a format...",
-            min_values=1,
-            max_values=1,
-            options=[discord.SelectOption(label="Loading...", value="0")]
-        )
-
-    async def refresh_options(self):
-        rows = await fetch_formats(self.field_id)
-        self.options = [discord.SelectOption(label=r["name"][:100], value=str(r["id"])) for r in rows[:25]]
-
-    async def callback(self, interaction: discord.Interaction):
-        format_id = int(self.values[0])
-        projects = await fetch_projects(self.field_id, format_id)
-        if not projects:
-            return await interaction.response.send_message("There are no projects in this format.", ephemeral=True)
-
-        await interaction.response.send_message(
-            "Choose a project:",
-            view=await AddProjectSelectView(self.field_id, format_id).setup(),
-            ephemeral=True,
-        )
-
-
-class AddProjectSelectView(discord.ui.View):
-    def __init__(self, field_id: int, format_id: int):
-        super().__init__(timeout=300)
-        self.select = AddProjectSelect(field_id, format_id)
-        self.add_item(self.select)
-
-    async def setup(self):
-        await self.select.refresh_options()
-        return self
-
-
-class AddProjectSelect(discord.ui.Select):
-    def __init__(self, field_id: int, format_id: int):
-        self.field_id = field_id
-        self.format_id = format_id
-        super().__init__(
-            placeholder="Select a project...",
-            min_values=1,
-            max_values=1,
-            options=[discord.SelectOption(label="Loading...", value="0")]
-        )
-
-    async def refresh_options(self):
-        rows = await fetch_projects(self.field_id, self.format_id)
-        self.options = [discord.SelectOption(label=r["name"][:100], value=str(r["id"])) for r in rows[:25]]
-
-    async def callback(self, interaction: discord.Interaction):
-        project_id = int(self.values[0])
-        project = await fetch_project(project_id)
-        if not project:
-            return await interaction.response.send_message("Project not found.", ephemeral=True)
-        if project["status"] != "in_development":
-            return await interaction.response.send_message(
-                "You can only add hours to projects that are **In Development**.",
-                ephemeral=True,
-            )
-
-        await interaction.response.send_modal(AddSegmentHoursModal(project_id))
-
-
-class AddSegmentHoursModal(discord.ui.Modal, title="Add Segment Hours"):
-    def __init__(self, project_id: int):
-        super().__init__()
-        self.project_id = project_id
-
-        self.build_time = discord.ui.TextInput(
-            label="Build",
-            placeholder="Example: 2h 30m or leave empty",
-            required=False,
-            max_length=20,
-        )
-        self.script_time = discord.ui.TextInput(
-            label="Script",
-            placeholder="Example: 1h or leave empty",
-            required=False,
-            max_length=20,
-        )
-        self.ui_time = discord.ui.TextInput(
-            label="UI",
-            placeholder="Example: 45m or leave empty",
-            required=False,
-            max_length=20,
-        )
-        self.thumbnail_time = discord.ui.TextInput(
-            label="Thumbnail",
-            placeholder="Example: 30m or leave empty",
-            required=False,
-            max_length=20,
-        )
-
-        self.add_item(self.build_time)
-        self.add_item(self.script_time)
-        self.add_item(self.ui_time)
-        self.add_item(self.thumbnail_time)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        project = await fetch_project(self.project_id)
-        if not project:
-            return await interaction.response.send_message("Project not found.", ephemeral=True)
-        if project["status"] != "in_development":
-            return await interaction.response.send_message(
-                "This project is no longer in development.",
-                ephemeral=True,
-            )
-
-        segments = await fetch_segments()
-        segment_map = {row["name"].lower(): row["id"] for row in segments}
-
-        inputs = [
-            ("build", self.build_time.value.strip()),
-            ("script", self.script_time.value.strip()),
-            ("ui", self.ui_time.value.strip()),
-            ("thumbnail", self.thumbnail_time.value.strip()),
-        ]
-
-        updates = []
-        total_added = 0
-
-        for segment_name, raw_value in inputs:
-            if not raw_value:
-                continue
-
-            minutes = parse_duration(raw_value)
-            if minutes is None:
-                return await interaction.response.send_message(
-                    f"Invalid time format for **{segment_name.title()}**. Use `2h 30m`, `2h`, or `30m`.",
-                    ephemeral=True,
-                )
-
-            segment_id = segment_map.get(segment_name)
-            if segment_id is None:
-                return await interaction.response.send_message(
-                    f"Segment **{segment_name.title()}** is missing from the database.",
-                    ephemeral=True,
-                )
-
-            updates.append((segment_id, minutes, segment_name.title()))
-            total_added += minutes
-
-        if not updates:
-            return await interaction.response.send_message(
-                "You need to enter at least one segment time.",
-                ephemeral=True,
-            )
-
-        for segment_id, minutes, _segment_name in updates:
-            await add_project_minutes(self.project_id, segment_id, minutes)
-
-        updated = await fetch_project(self.project_id)
-        rows = await fetch_project_segment_rows(self.project_id)
-
-        summary_lines = [
-            f"**{segment_name}**: +{format_duration(minutes)}"
-            for _segment_id, minutes, segment_name in updates
-        ]
-
-        await interaction.response.send_message(
-            content=(
-                "Added time successfully:\n" +
-                "\n".join(summary_lines) +
-                f"\n\n**Total Added:** {format_duration(total_added)}"
-            ),
-            embed=build_project_embed(updated, rows),
-            view=ProjectActionView(self.project_id, updated["status"]),
-            ephemeral=True,
-        )
-
-
-# -----------------------------
-# /summary flow
-# -----------------------------
-class SummaryMenuView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-
-    @discord.ui.button(label="Field", emoji="📁", style=discord.ButtonStyle.secondary)
-    async def field_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        fields = await fetch_fields()
-        if not fields:
-            return await interaction.response.send_message(
-                "There are no fields yet.",
-                ephemeral=True,
-            )
-
-        await interaction.response.send_message(
-            "Choose a field:",
-            view=await SummaryFieldSelectView(mode="field").setup(),
-            ephemeral=True,
-        )
-
-    @discord.ui.button(label="Format", emoji="📦", style=discord.ButtonStyle.secondary)
-    async def format_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        fields = await fetch_fields()
-        if not fields:
-            return await interaction.response.send_message(
-                "There are no fields yet.",
-                ephemeral=True,
-            )
-
-        await interaction.response.send_message(
-            "Choose a field first:",
-            view=await SummaryFieldSelectView(mode="format").setup(),
-            ephemeral=True,
-        )
-
-
-class SummaryFieldSelectView(discord.ui.View):
-    def __init__(self, mode: str):
-        super().__init__(timeout=300)
-        self.select = SummaryFieldSelect(mode)
-        self.add_item(self.select)
-
-    async def setup(self):
-        await self.select.refresh_options()
-        return self
-
-
-class SummaryFieldSelect(discord.ui.Select):
-    def __init__(self, mode: str):
-        self.mode = mode
-        super().__init__(
-            placeholder="Select a field...",
-            min_values=1,
-            max_values=1,
-            options=[discord.SelectOption(label="Loading...", value="0")],
-        )
-
-    async def refresh_options(self):
-        rows = await fetch_fields()
-        self.options = [
-            discord.SelectOption(label=row["name"][:100], value=str(row["id"]))
-            for row in rows[:25]
-        ]
-
-    async def callback(self, interaction: discord.Interaction):
-        field_id = int(self.values[0])
-
-        if self.mode == "field":
-            field = await fetch_field(field_id)
-            if not field:
-                return await interaction.response.send_message("Field not found.", ephemeral=True)
-
-            format_rows = await fetch_won_format_totals_by_field(field_id)
-            winrate_row = await fetch_winrate_by_field(field_id)
-
-            won = int(winrate_row["won"] or 0)
-            missed = int(winrate_row["missed"] or 0)
-
-            return await interaction.response.send_message(
-                embed=build_field_summary_embed(field["name"], format_rows, won, missed),
-                ephemeral=True,
-            )
-
-        formats = await fetch_formats(field_id)
-        if not formats:
-            return await interaction.response.send_message(
-                "This field has no formats.",
-                ephemeral=True,
-            )
-
-        await interaction.response.send_message(
-            "Choose a format:",
-            view=await SummaryFormatSelectView(field_id).setup(),
-            ephemeral=True,
-        )
-
-
-class SummaryFormatSelectView(discord.ui.View):
-    def __init__(self, field_id: int):
-        super().__init__(timeout=300)
-        self.select = SummaryFormatSelect(field_id)
-        self.add_item(self.select)
-
-    async def setup(self):
-        await self.select.refresh_options()
-        return self
-
-
-class SummaryFormatSelect(discord.ui.Select):
-    def __init__(self, field_id: int):
-        self.field_id = field_id
-        super().__init__(
-            placeholder="Select a format...",
-            min_values=1,
-            max_values=1,
-            options=[discord.SelectOption(label="Loading...", value="0")],
-        )
-
-    async def refresh_options(self):
-        rows = await fetch_formats(self.field_id)
-        self.options = [
-            discord.SelectOption(label=row["name"][:100], value=str(row["id"]))
-            for row in rows[:25]
-        ]
-
-    async def callback(self, interaction: discord.Interaction):
-        format_id = int(self.values[0])
-
-        format_row = await fetch_format(format_id)
-        if not format_row:
-            return await interaction.response.send_message("Format not found.", ephemeral=True)
-
-        project_rows = await fetch_won_project_totals_by_format(format_id)
-        winrate_row = await fetch_winrate_by_format(format_id)
-
-        won = int(winrate_row["won"] or 0)
-        missed = int(winrate_row["missed"] or 0)
-
-        await interaction.response.send_message(
-            embed=build_format_summary_embed(format_row["name"], project_rows, won, missed),
-            ephemeral=True,
-        )
-
-
-# -----------------------------
-# /lead flow
-# -----------------------------
-class TargetFormatFieldSelectView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-        self.select = TargetFormatFieldSelect()
-        self.add_item(self.select)
-
-    async def setup(self):
-        await self.select.refresh_options()
-        return self
-
-
-class TargetFormatFieldSelect(discord.ui.Select):
-    def __init__(self):
-        super().__init__(
-            placeholder="Select a field...",
-            min_values=1,
-            max_values=1,
-            options=[discord.SelectOption(label="Loading...", value="0")]
-        )
-
-    async def refresh_options(self):
-        rows = await fetch_fields()
-        self.options = [
-            discord.SelectOption(label=row["name"][:100], value=str(row["id"]))
-            for row in rows[:25]
-        ]
-
-    async def callback(self, interaction: discord.Interaction):
-        field_id = int(self.values[0])
-
-        field = await fetch_field(field_id)
-        if not field:
-            return await interaction.response.send_message("Field not found.", ephemeral=True)
-
-        rows = await fetch_format_leaderboard_rows_by_field(field_id)
-
-        await interaction.response.send_message(
-            embed=build_lead_embed(rows, f"Target Format Leaderboard — {field['name']}"),
-            ephemeral=True,
-        )
-
-
-class LeadMenuView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-
-    @discord.ui.button(label="Field", emoji="📁", style=discord.ButtonStyle.secondary)
-    async def field_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        rows = await fetch_field_leaderboard_rows()
-        await interaction.response.send_message(
-            embed=build_lead_embed(rows, "Field Leaderboard"),
-            ephemeral=True,
-        )
-
-    @discord.ui.button(label="Format", emoji="📦", style=discord.ButtonStyle.secondary)
-    async def format_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        rows = await fetch_format_leaderboard_rows()
-        await interaction.response.send_message(
-            embed=build_lead_embed(rows, "Format Leaderboard"),
-            ephemeral=True,
-        )
-
-    @discord.ui.button(label="Target Format", emoji="🎯", style=discord.ButtonStyle.secondary)
-    async def target_format_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        fields = await fetch_fields()
-        if not fields:
-            return await interaction.response.send_message(
-                "There are no fields yet.",
-                ephemeral=True,
-            )
-
-        await interaction.response.send_message(
-            "Choose a field:",
-            view=await TargetFormatFieldSelectView().setup(),
-            ephemeral=True,
-        )
-
-
-# -----------------------------
-# /winrate flow
-# -----------------------------
-class WinrateMenuView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-        self.add_item(WinrateMenuSelect())
-
-
-class WinrateMenuSelect(discord.ui.Select):
-    def __init__(self):
-        options = [
-            discord.SelectOption(label="Overall", value="overall", emoji="📈"),
-            discord.SelectOption(label="By Field", value="field", emoji="📁"),
-            discord.SelectOption(label="By Format", value="format", emoji="🧩"),
-        ]
-        super().__init__(
-            placeholder="Choose winrate type...",
-            min_values=1,
-            max_values=1,
-            options=options,
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        choice = self.values[0]
-
-        if choice == "overall":
-            row = await fetch_winrate_overall()
-            won = int(row["won"] or 0)
-            missed = int(row["missed"] or 0)
-            return await interaction.response.send_message(
-                embed=build_winrate_embed("Overall Winrate", won, missed),
-                ephemeral=True,
-            )
-
-        fields = await fetch_fields()
-        if not fields:
-            return await interaction.response.send_message("There are no fields yet.", ephemeral=True)
-
-        if choice == "field":
-            return await interaction.response.send_message(
-                "Choose a field:",
-                view=await WinrateFieldSelectView(by_format=False).setup(),
-                ephemeral=True,
-            )
-
-        return await interaction.response.send_message(
-            "Choose a field first:",
-            view=await WinrateFieldSelectView(by_format=True).setup(),
-            ephemeral=True,
-        )
-
-
-class WinrateFieldSelectView(discord.ui.View):
-    def __init__(self, by_format: bool):
-        super().__init__(timeout=300)
-        self.select = WinrateFieldSelect(by_format)
-        self.add_item(self.select)
-
-    async def setup(self):
-        await self.select.refresh_options()
-        return self
-
-
-class WinrateFieldSelect(discord.ui.Select):
-    def __init__(self, by_format: bool):
-        self.by_format = by_format
-        super().__init__(
-            placeholder="Select a field...",
-            min_values=1,
-            max_values=1,
-            options=[discord.SelectOption(label="Loading...", value="0")]
-        )
-
-    async def refresh_options(self):
-        rows = await fetch_fields()
-        self.options = [discord.SelectOption(label=r["name"][:100], value=str(r["id"])) for r in rows[:25]]
-
-    async def callback(self, interaction: discord.Interaction):
-        field_id = int(self.values[0])
-
-        if not self.by_format:
-            row = await fetch_winrate_by_field(field_id)
-            won = int(row["won"] or 0)
-            missed = int(row["missed"] or 0)
-
-            fields = await fetch_fields()
-            field_name = next((f["name"] for f in fields if f["id"] == field_id), "Field")
-
-            return await interaction.response.send_message(
-                embed=build_winrate_embed(f"Winrate — {field_name}", won, missed),
-                ephemeral=True,
-            )
-
-        formats = await fetch_formats(field_id)
-        if not formats:
-            return await interaction.response.send_message("This field has no formats.", ephemeral=True)
-
-        await interaction.response.send_message(
-            "Choose a format:",
-            view=await WinrateFormatSelectView(field_id).setup(),
-            ephemeral=True,
-        )
-
-
-class WinrateFormatSelectView(discord.ui.View):
-    def __init__(self, field_id: int):
-        super().__init__(timeout=300)
-        self.select = WinrateFormatSelect(field_id)
-        self.add_item(self.select)
-
-    async def setup(self):
-        await self.select.refresh_options()
-        return self
-
-
-class WinrateFormatSelect(discord.ui.Select):
-    def __init__(self, field_id: int):
-        self.field_id = field_id
-        super().__init__(
-            placeholder="Select a format...",
-            min_values=1,
-            max_values=1,
-            options=[discord.SelectOption(label="Loading...", value="0")]
-        )
-
-    async def refresh_options(self):
-        rows = await fetch_formats(self.field_id)
-        self.options = [discord.SelectOption(label=r["name"][:100], value=str(r["id"])) for r in rows[:25]]
-
-    async def callback(self, interaction: discord.Interaction):
-        format_id = int(self.values[0])
-        row = await fetch_winrate_by_format(format_id)
-        won = int(row["won"] or 0)
-        missed = int(row["missed"] or 0)
-
-        formats = await fetch_formats(self.field_id)
-        format_name = next((f["name"] for f in formats if f["id"] == format_id), "Format")
-
-        await interaction.response.send_message(
-            embed=build_winrate_embed(f"Winrate — {format_name}", won, missed),
-            ephemeral=True,
-        )
-
-
-# -----------------------------
-# /edit flow
-# -----------------------------
-EDIT_ACTIONS = [
-    ("Add Field", "add_field", "➕"),
-    ("Delete Field", "delete_field", "🗑️"),
-    ("Add Format", "add_format", "➕"),
-    ("Delete Format", "delete_format", "🗑️"),
-    ("Add Segment", "add_segment", "➕"),
-    ("Delete Segment", "delete_segment", "🗑️"),
-    ("Rename Project", "rename_project", "✏️"),
-    ("Move Project", "move_project", "📦"),
-    ("Delete Project", "delete_project", "🗑️"),
-    ("Change Project Status", "change_status", "🔁"),
-    ("Reopen Project", "reopen_project", "↩️"),
-    ("Set Segment Hours", "set_segment_hours", "⏱️"),
-]
-
-
-class EditMenuView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-        self.add_item(EditMenuSelect())
-
-
-class EditMenuSelect(discord.ui.Select):
-    def __init__(self):
-        options = [
-            discord.SelectOption(label=label, value=value, emoji=emoji)
-            for label, value, emoji in EDIT_ACTIONS
-        ]
-        super().__init__(
-            placeholder="Choose an edit action...",
-            min_values=1,
-            max_values=1,
-            options=options,
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        if not has_maintenance_role(interaction):
-            return await interaction.response.send_message("You do not have permission to use edit.", ephemeral=True)
-
-        action = self.values[0]
-
-        if action == "add_field":
-            return await interaction.response.send_modal(SimpleNameModal("Add Field", "Field Name", "field"))
-
-        if action == "add_segment":
-            return await interaction.response.send_modal(SimpleNameModal("Add Segment", "Segment Name", "segment"))
-
-        if action == "delete_field":
-            return await interaction.response.send_message(
-                "Choose a field to delete:",
-                view=await EditFieldView("delete_field").setup(),
-                ephemeral=True,
-            )
-
-        if action == "add_format":
-            return await interaction.response.send_message(
-                "Choose a field for the new format:",
-                view=await EditFieldView("add_format").setup(),
-                ephemeral=True,
-            )
-
-        if action == "delete_format":
-            return await interaction.response.send_message(
-                "Choose a field first:",
-                view=await EditFieldView("delete_format").setup(),
-                ephemeral=True,
-            )
-
-        if action == "delete_segment":
-            return await interaction.response.send_message(
-                "Choose a segment to delete:",
-                view=await EditSegmentView("delete_segment").setup(),
-                ephemeral=True,
-            )
-
-        if action in {
-            "rename_project",
-            "move_project",
-            "delete_project",
-            "change_status",
-            "reopen_project",
-            "set_segment_hours",
-        }:
-            return await interaction.response.send_message(
-                "Choose a field first:",
-                view=await EditFieldView(action).setup(),
-                ephemeral=True,
-            )
-
-
-class SimpleNameModal(discord.ui.Modal):
-    def __init__(self, title_text: str, label_text: str, mode: str):
-        self.mode = mode
-        super().__init__(title=title_text)
-        self.name_input = discord.ui.TextInput(
-            label=label_text,
-            required=True,
-            max_length=100,
-        )
-        self.add_item(self.name_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        value = self.name_input.value.strip()
-        if not value:
-            return await interaction.response.send_message("Value cannot be empty.", ephemeral=True)
-
-        if self.mode == "field":
-            ok = await create_field(value)
-            if not ok:
-                return await interaction.response.send_message("That field already exists.", ephemeral=True)
-            return await interaction.response.send_message(f"Added field **{value}**.", ephemeral=True)
-
-        if self.mode == "segment":
-            ok = await create_segment(value)
-            if not ok:
-                return await interaction.response.send_message("That segment already exists.", ephemeral=True)
-            return await interaction.response.send_message(f"Added segment **{value}**.", ephemeral=True)
-
-        await interaction.response.send_message("Unknown action.", ephemeral=True)
-
-
-class AddFormatModal(discord.ui.Modal, title="Add Format"):
-    def __init__(self, field_id: int):
-        super().__init__()
-        self.field_id = field_id
-        self.name_input = discord.ui.TextInput(
-            label="Format Name",
-            required=True,
-            max_length=100,
-        )
-        self.add_item(self.name_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        value = self.name_input.value.strip()
-        if not value:
-            return await interaction.response.send_message("Format name cannot be empty.", ephemeral=True)
-
-        ok = await create_format(self.field_id, value)
-        if not ok:
-            return await interaction.response.send_message("That format already exists.", ephemeral=True)
-
-        await interaction.response.send_message(f"Added format **{value}**.", ephemeral=True)
-
-
-class EditFieldView(discord.ui.View):
-    def __init__(self, action: str):
-        super().__init__(timeout=300)
-        self.select = EditFieldSelect(action)
-        self.add_item(self.select)
-
-    async def setup(self):
-        await self.select.refresh_options()
-        return self
-
-
-class EditFieldSelect(discord.ui.Select):
-    def __init__(self, action: str):
-        self.action = action
-        super().__init__(
-            placeholder="Select a field...",
-            min_values=1,
-            max_values=1,
-            options=[discord.SelectOption(label="Loading...", value="0")]
-        )
-
-    async def refresh_options(self):
-        rows = await fetch_fields()
-        self.options = [discord.SelectOption(label=r["name"][:100], value=str(r["id"])) for r in rows[:25]]
-
-    async def callback(self, interaction: discord.Interaction):
-        field_id = int(self.values[0])
-
-        if self.action == "delete_field":
-            await delete_field(field_id)
-            return await interaction.response.send_message(
-                "Field deleted. Everything inside it was also deleted.",
-                ephemeral=True,
-            )
-
-        if self.action == "add_format":
-            return await interaction.response.send_modal(AddFormatModal(field_id))
-
-        if self.action == "delete_format":
-            formats = await fetch_formats(field_id)
-            if not formats:
-                return await interaction.response.send_message("This field has no formats.", ephemeral=True)
-            return await interaction.response.send_message(
-                "Choose a format:",
-                view=await EditFormatView(field_id, self.action).setup(),
-                ephemeral=True,
-            )
-
-        if self.action in {
-            "rename_project",
-            "move_project",
-            "delete_project",
-            "change_status",
-            "reopen_project",
-            "set_segment_hours",
-        }:
-            formats = await fetch_formats(field_id)
-            if not formats:
-                return await interaction.response.send_message("This field has no formats.", ephemeral=True)
-            return await interaction.response.send_message(
-                "Choose a format:",
-                view=await EditFormatView(field_id, self.action).setup(),
-                ephemeral=True,
-            )
-
-
-class EditFormatView(discord.ui.View):
-    def __init__(self, field_id: int, action: str):
-        super().__init__(timeout=300)
-        self.select = EditFormatSelect(field_id, action)
-        self.add_item(self.select)
-
-    async def setup(self):
-        await self.select.refresh_options()
-        return self
-
-
-class EditFormatSelect(discord.ui.Select):
-    def __init__(self, field_id: int, action: str):
-        self.field_id = field_id
-        self.action = action
-        super().__init__(
-            placeholder="Select a format...",
-            min_values=1,
-            max_values=1,
-            options=[discord.SelectOption(label="Loading...", value="0")]
-        )
-
-    async def refresh_options(self):
-        rows = await fetch_formats(self.field_id)
-        self.options = [discord.SelectOption(label=r["name"][:100], value=str(r["id"])) for r in rows[:25]]
-
-    async def callback(self, interaction: discord.Interaction):
-        format_id = int(self.values[0])
-
-        if self.action == "delete_format":
-            await delete_format(format_id)
-            return await interaction.response.send_message(
-                "Format deleted. Everything inside it was also deleted.",
-                ephemeral=True,
-            )
-
-        projects = await fetch_projects(self.field_id, format_id)
-        if not projects:
-            return await interaction.response.send_message("There are no projects here.", ephemeral=True)
-
-        await interaction.response.send_message(
-            "Choose a project:",
-            view=await EditProjectView(self.action, self.field_id, format_id).setup(),
-            ephemeral=True,
-        )
-
-
-class EditProjectView(discord.ui.View):
-    def __init__(self, action: str, field_id: int, format_id: int):
-        super().__init__(timeout=300)
-        self.select = EditProjectSelect(action, field_id, format_id)
-        self.add_item(self.select)
-
-    async def setup(self):
-        await self.select.refresh_options()
-        return self
-
-
-class EditProjectSelect(discord.ui.Select):
-    def __init__(self, action: str, field_id: int, format_id: int):
-        self.action = action
-        self.field_id = field_id
-        self.format_id = format_id
-        super().__init__(
-            placeholder="Select a project...",
-            min_values=1,
-            max_values=1,
-            options=[discord.SelectOption(label="Loading...", value="0")]
-        )
-
-    async def refresh_options(self):
-        rows = await fetch_projects(self.field_id, self.format_id)
-        self.options = [discord.SelectOption(label=r["name"][:100], value=str(r["id"])) for r in rows[:25]]
-
-    async def callback(self, interaction: discord.Interaction):
-        project_id = int(self.values[0])
-
-        if self.action == "rename_project":
-            return await interaction.response.send_modal(RenameProjectModal(project_id))
-
-        if self.action == "move_project":
-            return await interaction.response.send_message(
-                "Choose the new field:",
-                view=await MoveProjectFieldView(project_id).setup(),
-                ephemeral=True,
-            )
-
-        if self.action == "delete_project":
-            await delete_project(project_id)
-            return await interaction.response.send_message(
-                "Project deleted successfully.",
-                ephemeral=True,
-            )
-
-        if self.action == "change_status":
-            return await interaction.response.send_message(
-                "Choose the new status:",
-                view=ChangeStatusView(project_id),
-                ephemeral=True,
-            )
-
-        if self.action == "reopen_project":
-            project = await fetch_project(project_id)
-            if not project:
-                return await interaction.response.send_message("Project not found.", ephemeral=True)
-            if project["status"] != "released":
-                return await interaction.response.send_message(
-                    "Reopen is only for released projects.",
-                    ephemeral=True,
-                )
-            await set_project_status(project_id, "in_development")
-            return await interaction.response.send_message(
-                "Project reopened to **In Development**.",
-                ephemeral=True,
-            )
-
-        if self.action == "set_segment_hours":
-            return await interaction.response.send_message(
-                "Choose a segment:",
-                view=await SetHoursSegmentView(project_id).setup(),
-                ephemeral=True,
-            )
-
-
-class RenameProjectModal(discord.ui.Modal, title="Rename Project"):
-    def __init__(self, project_id: int):
-        super().__init__()
-        self.project_id = project_id
-        self.name_input = discord.ui.TextInput(
-            label="New Project Name",
-            required=True,
-            max_length=100,
-        )
-        self.add_item(self.name_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        new_name = self.name_input.value.strip()
-        if not new_name:
-            return await interaction.response.send_message("Name cannot be empty.", ephemeral=True)
-
-        ok = await rename_project(self.project_id, new_name)
-        if not ok:
-            return await interaction.response.send_message("That project name already exists.", ephemeral=True)
-
-        await interaction.response.send_message("Project renamed successfully.", ephemeral=True)
-
-
-class MoveProjectFieldView(discord.ui.View):
-    def __init__(self, project_id: int):
-        super().__init__(timeout=300)
-        self.select = MoveProjectFieldSelect(project_id)
-        self.add_item(self.select)
-
-    async def setup(self):
-        await self.select.refresh_options()
-        return self
-
-
-class MoveProjectFieldSelect(discord.ui.Select):
-    def __init__(self, project_id: int):
-        self.project_id = project_id
-        super().__init__(
-            placeholder="Select the new field...",
-            min_values=1,
-            max_values=1,
-            options=[discord.SelectOption(label="Loading...", value="0")]
-        )
-
-    async def refresh_options(self):
-        rows = await fetch_fields()
-        self.options = [discord.SelectOption(label=r["name"][:100], value=str(r["id"])) for r in rows[:25]]
-
-    async def callback(self, interaction: discord.Interaction):
-        field_id = int(self.values[0])
-        formats = await fetch_formats(field_id)
-        if not formats:
-            return await interaction.response.send_message("That field has no formats.", ephemeral=True)
-
-        await interaction.response.send_message(
-            "Choose the new format:",
-            view=await MoveProjectFormatView(self.project_id, field_id).setup(),
-            ephemeral=True,
-        )
-
-
-class MoveProjectFormatView(discord.ui.View):
-    def __init__(self, project_id: int, field_id: int):
-        super().__init__(timeout=300)
-        self.select = MoveProjectFormatSelect(project_id, field_id)
-        self.add_item(self.select)
-
-    async def setup(self):
-        await self.select.refresh_options()
-        return self
-
-
-class MoveProjectFormatSelect(discord.ui.Select):
-    def __init__(self, project_id: int, field_id: int):
-        self.project_id = project_id
-        self.field_id = field_id
-        super().__init__(
-            placeholder="Select the new format...",
-            min_values=1,
-            max_values=1,
-            options=[discord.SelectOption(label="Loading...", value="0")]
-        )
-
-    async def refresh_options(self):
-        rows = await fetch_formats(self.field_id)
-        self.options = [discord.SelectOption(label=r["name"][:100], value=str(r["id"])) for r in rows[:25]]
-
-    async def callback(self, interaction: discord.Interaction):
-        format_id = int(self.values[0])
-        await move_project(self.project_id, self.field_id, format_id)
-        await interaction.response.send_message("Project moved successfully.", ephemeral=True)
-
-
-class ChangeStatusView(discord.ui.View):
-    def __init__(self, project_id: int):
-        super().__init__(timeout=300)
-        self.add_item(ChangeStatusSelect(project_id))
-
-
-class ChangeStatusSelect(discord.ui.Select):
-    def __init__(self, project_id: int):
-        self.project_id = project_id
-        options = [
-            discord.SelectOption(label="In Development", value="in_development", emoji="🛠️"),
-            discord.SelectOption(label="Released", value="released", emoji="🚀"),
-            discord.SelectOption(label="Won", value="won", emoji="🏆"),
-            discord.SelectOption(label="Missed", value="missed", emoji="🗑️"),
-        ]
-        super().__init__(
-            placeholder="Select the new status...",
-            min_values=1,
-            max_values=1,
-            options=options,
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        status = self.values[0]
-        await set_project_status(self.project_id, status)
-        await interaction.response.send_message(f"Project status changed to **{status}**.", ephemeral=True)
-
-
-class EditSegmentView(discord.ui.View):
-    def __init__(self, action: str):
-        super().__init__(timeout=300)
-        self.select = EditSegmentSelect(action)
-        self.add_item(self.select)
-
-    async def setup(self):
-        await self.select.refresh_options()
-        return self
-
-
-class EditSegmentSelect(discord.ui.Select):
-    def __init__(self, action: str):
-        self.action = action
-        super().__init__(
-            placeholder="Select a segment...",
-            min_values=1,
-            max_values=1,
-            options=[discord.SelectOption(label="Loading...", value="0")]
-        )
-
-    async def refresh_options(self):
-        rows = await fetch_segments()
-        self.options = [discord.SelectOption(label=r["name"][:100], value=str(r["id"])) for r in rows[:25]]
-
-    async def callback(self, interaction: discord.Interaction):
-        segment_id = int(self.values[0])
-
-        if self.action == "delete_segment":
-            await delete_segment(segment_id)
-            return await interaction.response.send_message(
-                "Segment deleted. Its saved hours were also deleted.",
-                ephemeral=True,
-            )
-
-        await interaction.response.send_message("Unknown segment action.", ephemeral=True)
-
-
-class SetHoursSegmentView(discord.ui.View):
-    def __init__(self, project_id: int):
-        super().__init__(timeout=300)
-        self.select = SetHoursSegmentSelect(project_id)
-        self.add_item(self.select)
-
-    async def setup(self):
-        await self.select.refresh_options()
-        return self
-
-
-class SetHoursSegmentSelect(discord.ui.Select):
-    def __init__(self, project_id: int):
-        self.project_id = project_id
-        super().__init__(
-            placeholder="Select a segment...",
-            min_values=1,
-            max_values=1,
-            options=[discord.SelectOption(label="Loading...", value="0")]
-        )
-
-    async def refresh_options(self):
-        rows = await fetch_segments()
-        self.options = [discord.SelectOption(label=r["name"][:100], value=str(r["id"])) for r in rows[:25]]
-
-    async def callback(self, interaction: discord.Interaction):
-        segment_id = int(self.values[0])
-        await interaction.response.send_modal(SetHoursModal(self.project_id, segment_id))
-
-
-class SetHoursModal(discord.ui.Modal, title="Set Segment Hours"):
-    def __init__(self, project_id: int, segment_id: int):
-        super().__init__()
-        self.project_id = project_id
-        self.segment_id = segment_id
-        self.duration = discord.ui.TextInput(
-            label="New total time",
-            placeholder="Example: 2h 30m",
-            required=True,
-            max_length=20,
-        )
-        self.add_item(self.duration)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        minutes = parse_duration(self.duration.value)
-        if minutes is None:
-            return await interaction.response.send_message(
-                "Invalid time format. Use `2h 30m`, `2h`, or `30m`.",
-                ephemeral=True,
-            )
-
-        await set_project_minutes(self.project_id, self.segment_id, minutes)
-        await interaction.response.send_message(
-            f"Segment hours set to **{format_duration(minutes)}**.",
-            ephemeral=True,
-        )
-
-
-# -----------------------------
-# Commands
-# -----------------------------
-@tree.command(name="project", description="Open the project manager", guild=discord.Object(id=GUILD_ID))
-async def project_command(interaction: discord.Interaction):
+    return day_id
+
+
+def weekly_range(anchor: dt.date):
+    start = anchor - dt.timedelta(days=anchor.weekday())
+    end = start + dt.timedelta(days=7)
+    return start, end
+
+
+def weekly_rows(user_id: int, anchor: dt.date):
+    start, end = weekly_range(anchor)
+    return db_all(
+        """
+        SELECT id, work_date, started_at, closed_at, status
+        FROM work_days
+        WHERE discord_user_id = %s AND work_date >= %s AND work_date < %s
+        ORDER BY work_date ASC, started_at ASC
+        """,
+        (user_id, start, end),
+    )
+
+
+def weekly_summary(user_id: int, anchor: dt.date):
+    rows = weekly_rows(user_id, anchor)
+    daily = []
+    task_totals = defaultdict(dt.timedelta)
+    week_total = dt.timedelta()
+    for row in rows:
+        end_at = row["closed_at"] or utc_now()
+        total, totals = day_summary(row["id"], end_at)
+        daily.append((row["work_date"], total, totals))
+        week_total += total
+        for task, duration in totals.items():
+            task_totals[task] += duration
+    return daily, week_total, dict(task_totals)
+
+
+def get_font(size: int, bold=False):
+    names = ["arialbd.ttf" if bold else "arial.ttf", "seguiemj.ttf", "calibri.ttf"]
+    for name in names:
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def make_dashboard_image(profile, daily, week_total, task_totals, anchor: dt.date):
+    width, height = 1200, 800
+    image = Image.new("RGB", (width, height), "#07111f")
+    draw = ImageDraw.Draw(image)
+    title_font = get_font(48, True)
+    heading_font = get_font(28, True)
+    body_font = get_font(24)
+    small_font = get_font(18)
+
+    for y in range(height):
+        blue = 31 + int(y / height * 30)
+        draw.line((0, y, width, y), fill=(7, 17, blue))
+
+    start, end = weekly_range(anchor)
+    draw.rounded_rectangle((40, 40, 1160, 760), radius=24, fill="#0b1628", outline="#17345c", width=2)
+    draw.text((80, 78), "Weekly Productivity", font=title_font, fill="#f5f9ff")
+    draw.text((82, 138), f"{profile['display_name']} | {ROLE_NAME} | {start} to {end - dt.timedelta(days=1)}", font=body_font, fill="#8fb7e8")
+    draw.text((880, 86), format_duration(week_total), font=title_font, fill="#58a6ff")
+    draw.text((884, 142), "total focused time", font=small_font, fill="#9fb3c8")
+
+    max_daily = max([total.total_seconds() for _, total, _ in daily] + [1])
+    x, y = 82, 220
+    draw.text((x, y - 45), "Daily totals", font=heading_font, fill="#f5f9ff")
+    for index in range(7):
+        day = start + dt.timedelta(days=index)
+        match = next((item for item in daily if item[0] == day), None)
+        total = match[1] if match else dt.timedelta()
+        bar_h = int((total.total_seconds() / max_daily) * 210)
+        bx = x + index * 90
+        draw.rounded_rectangle((bx, y, bx + 54, y + 230), radius=12, fill="#101f36")
+        draw.rounded_rectangle((bx, y + 230 - bar_h, bx + 54, y + 230), radius=12, fill="#2f81f7")
+        draw.text((bx - 2, y + 246), day.strftime("%a"), font=small_font, fill="#c7d7ea")
+        draw.text((bx - 10, y + 272), format_duration(total), font=small_font, fill="#8fb7e8")
+
+    tx, ty = 760, 220
+    draw.text((tx, ty - 45), "Top tasks", font=heading_font, fill="#f5f9ff")
+    max_task = max([duration.total_seconds() for duration in task_totals.values()] + [1])
+    for index, (task, duration) in enumerate(sorted(task_totals.items(), key=lambda item: item[1], reverse=True)[:8]):
+        row_y = ty + index * 56
+        draw.text((tx, row_y), task[:26], font=body_font, fill="#eaf2ff")
+        draw.text((1040, row_y), format_duration(duration), font=small_font, fill="#8fb7e8")
+        bar_w = int((duration.total_seconds() / max_task) * 330)
+        draw.rounded_rectangle((tx, row_y + 32, tx + 330, row_y + 42), radius=5, fill="#10223d")
+        draw.rounded_rectangle((tx, row_y + 32, tx + bar_w, row_y + 42), radius=5, fill="#58a6ff")
+
+    output = os.path.join(tempfile.gettempdir(), f"productivity_week_{profile['discord_user_id']}_{anchor}.png")
+    image.save(output)
+    return output
+
+
+@bot.tree.command(name="profile", description="Create or update your productivity profile.")
+@app_commands.describe(display_name="Profile display name", channel_id="Your manually-created private channel ID")
+async def profile(interaction: discord.Interaction, display_name: str, channel_id: str | None = None):
+    parsed_channel_id = int(channel_id) if channel_id else None
+    ensure_profile(interaction.user, display_name, parsed_channel_id)
     await interaction.response.send_message(
-        embed=build_home_embed(),
-        view=ProjectHomeView(),
+        f"Profile saved: **{display_name}** | Role: **{ROLE_NAME}**",
         ephemeral=True,
     )
 
 
-@tree.command(name="add", description="Add time to a project segment", guild=discord.Object(id=GUILD_ID))
-async def add_command(interaction: discord.Interaction):
-    fields = await fetch_fields()
-    if not fields:
-        return await interaction.response.send_message(
-            "There are no fields yet. Ask someone with the edit role to add one.",
-            ephemeral=True,
-        )
+@bot.tree.command(name="startday", description="Start your productivity day and send today's tasks.")
+async def startday(interaction: discord.Interaction):
+    if get_active_day(interaction.user.id):
+        await interaction.response.send_message("You already have an active day. Use `/closeday` first.", ephemeral=True)
+        return
 
+    ensure_profile(interaction.user)
     await interaction.response.send_message(
-        "Choose a field:",
-        view=await AddFieldSelectView().setup(),
+        "Send today's tasks in this channel now, one task per line. I will add `Self-care` as the last option.",
+        ephemeral=True,
+    )
+
+    def check(message: discord.Message):
+        return message.author.id == interaction.user.id and message.channel.id == interaction.channel_id
+
+    try:
+        message = await bot.wait_for("message", check=check, timeout=300)
+    except asyncio.TimeoutError:
+        await interaction.followup.send("Timed out waiting for your task list.", ephemeral=True)
+        return
+
+    task_names = [line.strip() for line in message.content.splitlines() if line.strip()]
+    task_names = [name for name in task_names if name.lower() != SELF_CARE_TASK.lower()]
+    if not task_names:
+        await interaction.followup.send("No tasks found. Start again and send at least one task.", ephemeral=True)
+        return
+    if len(task_names) > MAX_CUSTOM_TASKS:
+        await interaction.followup.send(f"Too many tasks. Send up to {MAX_CUSTOM_TASKS} tasks plus Self-care.", ephemeral=True)
+        return
+
+    task_names.append(SELF_CARE_TASK)
+    day_id = create_day(interaction.user.id, task_names)
+    await interaction.followup.send(
+        f"Day started with {len(task_names)} tasks. Check your DMs to choose your starting task.",
+        ephemeral=True,
+    )
+    await run_checkin(interaction.user.id, "Choose what you are starting with.")
+
+
+@bot.tree.command(name="closeday", description="Close your active day and show the time spent per task.")
+async def closeday(interaction: discord.Interaction):
+    day = get_active_day(interaction.user.id)
+    if not day:
+        await interaction.response.send_message("You do not have an active day.", ephemeral=True)
+        return
+
+    closed_at = utc_now()
+    db_exec("UPDATE task_segments SET ended_at = %s WHERE day_id = %s AND ended_at IS NULL", (closed_at, day["id"]))
+    db_exec("UPDATE work_days SET status = 'closed', closed_at = %s, next_checkin_at = NULL WHERE id = %s", (closed_at, day["id"]))
+    total, totals = day_summary(day["id"], closed_at)
+    await interaction.response.send_message(build_summary_text("Day closed", total, totals))
+
+
+@bot.tree.command(name="stats", description="Show a user's saved profile stats.")
+@app_commands.describe(user="User to check")
+async def stats(interaction: discord.Interaction, user: discord.Member | None = None):
+    target = user or interaction.user
+    profile_row = get_profile(target.id)
+    if not profile_row:
+        await interaction.response.send_message("No profile found for that user.", ephemeral=True)
+        return
+
+    days = db_all(
+        "SELECT id, closed_at FROM work_days WHERE discord_user_id = %s AND status = 'closed'",
+        (target.id,),
+    )
+    total = dt.timedelta()
+    for row in days:
+        day_total, _ = day_summary(row["id"], row["closed_at"])
+        total += day_total
+    average = total / len(days) if days else dt.timedelta()
+    await interaction.response.send_message(
+        f"**{profile_row['display_name']}**\nRole: **{ROLE_NAME}**\n"
+        f"Closed days: **{len(days)}**\nDaily average: **{format_duration(average)}**"
+    )
+
+
+@bot.tree.command(name="weekly", description="Show weekly productivity stats.")
+@app_commands.describe(user="User to check", mode="How to show the weekly stats", date="Any date in the target week, YYYY-MM-DD")
+@app_commands.choices(
+    mode=[
+        app_commands.Choice(name="overview_text", value="overview"),
+        app_commands.Choice(name="separate_days", value="days"),
+        app_commands.Choice(name="dashboard_image", value="image"),
+    ]
+)
+async def weekly(
+    interaction: discord.Interaction,
+    user: discord.Member | None = None,
+    mode: app_commands.Choice[str] | None = None,
+    date: str | None = None,
+):
+    await interaction.response.defer()
+    target = user or interaction.user
+    profile_row = get_profile(target.id)
+    if not profile_row:
+        await interaction.followup.send("No profile found for that user.")
+        return
+
+    try:
+        anchor = parse_local_date(date)
+    except ValueError as exc:
+        await interaction.followup.send(str(exc), ephemeral=True)
+        return
+
+    selected_mode = mode.value if mode else "overview"
+    daily, week_total, task_totals = weekly_summary(target.id, anchor)
+    if selected_mode == "image":
+        path = make_dashboard_image(profile_row, daily, week_total, task_totals, anchor)
+        await interaction.followup.send(file=discord.File(path, filename="weekly-productivity.png"))
+        return
+
+    if selected_mode == "days":
+        if not daily:
+            await interaction.followup.send("No days found for that week.")
+            return
+        for work_date, total, totals in daily:
+            await interaction.followup.send(build_summary_text(str(work_date), total, totals))
+        return
+
+    start, end = weekly_range(anchor)
+    text = build_summary_text(f"Week {start} to {end - dt.timedelta(days=1)}", week_total, task_totals)
+    for chunk in split_discord_messages(text):
+        await interaction.followup.send(chunk)
+
+
+@bot.tree.command(name="daystats", description="Show one saved day for a user.")
+@app_commands.describe(user="User to check", date="Day to show, YYYY-MM-DD")
+async def daystats(interaction: discord.Interaction, user: discord.Member | None = None, date: str | None = None):
+    target = user or interaction.user
+    try:
+        work_date = parse_local_date(date)
+    except ValueError as exc:
+        await interaction.response.send_message(str(exc), ephemeral=True)
+        return
+
+    row = db_one(
+        """
+        SELECT id, closed_at
+        FROM work_days
+        WHERE discord_user_id = %s AND work_date = %s
+        ORDER BY started_at DESC
+        LIMIT 1
+        """,
+        (target.id, work_date),
+    )
+    if not row:
+        await interaction.response.send_message("No day found for that date.", ephemeral=True)
+        return
+    total, totals = day_summary(row["id"], row["closed_at"] or utc_now())
+    await interaction.response.send_message(build_summary_text(str(work_date), total, totals))
+
+
+@bot.tree.command(name="test_profile", description="Test profile saving.")
+async def test_profile(interaction: discord.Interaction):
+    ensure_profile(interaction.user)
+    await interaction.response.send_message("Profile test passed.", ephemeral=True)
+
+
+@bot.tree.command(name="test_startday", description="Test the startday prompt.")
+async def test_startday(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        "Startday test: `/startday` will ask for a multiline task message, then append Self-care.",
         ephemeral=True,
     )
 
 
-@tree.command(name="summary", description="Show project summaries", guild=discord.Object(id=GUILD_ID))
-async def summary_command(interaction: discord.Interaction):
-    await interaction.response.send_message(
-        embed=build_summary_menu_embed(),
-        view=SummaryMenuView(),
-        ephemeral=True,
-    )
+@bot.tree.command(name="test_checkin", description="Send yourself a check-in using your active day.")
+async def test_checkin(interaction: discord.Interaction):
+    if not get_active_day(interaction.user.id):
+        await interaction.response.send_message("Start a day first with `/startday`.", ephemeral=True)
+        return
+    await interaction.response.send_message("Sending test check-in to your DMs.", ephemeral=True)
+    await run_checkin(interaction.user.id, "Manual test check-in.")
 
 
-@tree.command(name="lead", description="Show the field, format, or target format leaderboard", guild=discord.Object(id=GUILD_ID))
-async def lead_command(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="📊 Leaderboard Panel",
-        description="Choose whether you want the **Field**, **Format**, or **Target Format** leaderboard.",
-        color=EMBED_COLOR,
-        timestamp=utcnow(),
-    )
-
-    await interaction.response.send_message(
-        embed=embed,
-        view=LeadMenuView(),
-        ephemeral=True,
-    )
+@bot.tree.command(name="test_closeday", description="Preview your active day totals without closing it.")
+async def test_closeday(interaction: discord.Interaction):
+    day = get_active_day(interaction.user.id)
+    if not day:
+        await interaction.response.send_message("No active day to preview.", ephemeral=True)
+        return
+    total, totals = day_summary(day["id"])
+    await interaction.response.send_message(build_summary_text("Close day preview", total, totals), ephemeral=True)
 
 
-@tree.command(name="winrate", description="Show project winrate", guild=discord.Object(id=GUILD_ID))
-async def winrate_command(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="📈 Winrate Panel",
-        description="Choose how you want to calculate the winrate.",
-        color=EMBED_COLOR,
-        timestamp=utcnow(),
-    )
-    embed.add_field(name="Options", value="Overall, By Field, or By Format", inline=False)
-
-    await interaction.response.send_message(
-        embed=embed,
-        view=WinrateMenuView(),
-        ephemeral=True,
-    )
-
-
-@tree.command(name="edit", description="Open the edit panel", guild=discord.Object(id=GUILD_ID))
-async def edit_command(interaction: discord.Interaction):
-    if not has_maintenance_role(interaction):
-        return await interaction.response.send_message(
-            "You do not have permission to use this command.",
-            ephemeral=True,
-        )
-
-    await interaction.response.send_message(
-        embed=build_edit_embed(),
-        view=EditMenuView(),
-        ephemeral=True,
-    )
-
-
-# -----------------------------
-# Events
-# -----------------------------
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user} ({bot.user.id})")
-    print("------")
+@bot.tree.command(name="test_weekly_image", description="Generate a test weekly dashboard image.")
+async def test_weekly_image(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    profile_row = get_profile(interaction.user.id)
+    if not profile_row:
+        ensure_profile(interaction.user)
+        profile_row = get_profile(interaction.user.id)
+    daily, week_total, task_totals = weekly_summary(interaction.user.id, local_now().date())
+    path = make_dashboard_image(profile_row, daily, week_total, task_totals, local_now().date())
+    await interaction.followup.send(file=discord.File(path, filename="weekly-productivity-test.png"), ephemeral=True)
 
 
 @bot.event
-async def setup_hook():
-    await init_db()
-    guild = discord.Object(id=GUILD_ID)
-    synced = await tree.sync(guild=guild)
-    print(f"Synced {len(synced)} command(s) to guild {GUILD_ID}")
+async def on_ready():
+    init_db()
+    synced = await bot.tree.sync()
+    if not checkin_scheduler.is_running():
+        checkin_scheduler.start()
+    print(f"{bot.user} is online. Synced {len(synced)} slash command(s).")
 
 
-# -----------------------------
-# Run
-# -----------------------------
-bot.run(DISCORD_TOKEN)
+def main():
+    if not TOKEN:
+        raise RuntimeError("DISCORD_TOKEN is missing.")
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is missing.")
+    bot.run(TOKEN)
+
+
+if __name__ == "__main__":
+    main()
