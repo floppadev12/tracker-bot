@@ -39,6 +39,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 conn = None
 checkin_locks = set()
 GUILD_ID = int(DISCORD_GUILD_ID) if DISCORD_GUILD_ID else None
+commands_synced = False
 
 
 def utc_now():
@@ -243,18 +244,22 @@ def day_summary(day_id: int, end_at=None):
 def format_duration(duration: dt.timedelta):
     seconds = max(0, int(duration.total_seconds()))
     hours, rem = divmod(seconds, 3600)
-    minutes = rem // 60
-    return f"{hours}h {minutes}m"
+    minutes, leftover_seconds = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m"
+    return f"{leftover_seconds}s"
 
 
 def build_summary_text(title: str, total: dt.timedelta, totals: dict[str, dt.timedelta]):
-    lines = [f"**{title}**", f"Total worked: **{format_duration(total)}**", ""]
+    lines = [f"**{title}**", f"⏱️ Total worked: **{format_duration(total)}**", ""]
     if not totals:
         lines.append("No tracked time yet.")
         return "\n".join(lines)
 
     for name, duration in sorted(totals.items(), key=lambda item: item[1], reverse=True):
-        lines.append(f"- **{name}**: {format_duration(duration)}")
+        lines.append(f"• **{name}**: {format_duration(duration)}")
     return "\n".join(lines)
 
 
@@ -326,12 +331,15 @@ class StartDayTaskModal(discord.ui.Modal, title="Start productivity day"):
             return
 
         task_names.append(SELF_CARE_TASK)
-        create_day(interaction.user.id, task_names)
+        day_id, started_at = create_day(interaction.user.id, task_names)
+        profile = get_profile(interaction.user.id)
+        display_name = profile["display_name"] if profile else interaction.user.display_name
         await interaction.response.send_message(
-            f"Day started with {len(task_names)} tasks. Check your DMs to choose your starting task.",
+            f"👋 Welcome back, **{display_name}**.\n"
+            f"Day started with **{len(task_names)}** tasks. Check your DMs to choose your starting task.",
             ephemeral=True,
         )
-        await run_checkin(interaction.user.id, "Choose what you are starting with.")
+        asyncio.create_task(run_checkin(interaction.user.id, "Choose what you are starting with.", started_at))
 
 
 async def ask_task_choice(user: discord.User, day_id: int, reason: str):
@@ -344,7 +352,7 @@ async def ask_task_choice(user: discord.User, day_id: int, reason: str):
         try:
             view = TaskSelectView(task_rows, prompt)
             await user.send(
-                f"**{PROJECT_NAME} productivity check-in**\n{reason}\nChoose your current task:",
+                f"📌 **{PROJECT_NAME} productivity check-in**\n{reason}\nChoose your current task:",
                 view=view,
             )
             task_id, answered_at = await asyncio.wait_for(view.future, timeout=timeout)
@@ -362,7 +370,7 @@ async def ask_task_choice(user: discord.User, day_id: int, reason: str):
     return task_rows[0]["id"], "default_first_task"
 
 
-async def run_checkin(user_id: int, reason: str):
+async def run_checkin(user_id: int, reason: str, segment_started_at: dt.datetime | None = None):
     if user_id in checkin_locks:
         return
     checkin_locks.add(user_id)
@@ -376,7 +384,8 @@ async def run_checkin(user_id: int, reason: str):
         task_id, source = await ask_task_choice(user, day["id"], reason)
         answered_at = utc_now() if source == "answered" else None
         if task_id:
-            switch_task(day["id"], task_id, answered_at or utc_now(), source)
+            start_at = segment_started_at or answered_at or utc_now()
+            switch_task(day["id"], task_id, start_at, source)
 
         db_exec(
             """
@@ -417,15 +426,28 @@ def create_day(user_id: int, task_names: list[str]):
             (user_id, work_date, started_at),
         )
         day_id = cur.fetchone()["id"]
+        first_task_id = None
         for index, name in enumerate(task_names, start=1):
             cur.execute(
                 """
                 INSERT INTO day_tasks (day_id, name, sort_order)
                 VALUES (%s, %s, %s)
+                RETURNING id
                 """,
                 (day_id, name, index),
             )
-    return day_id
+            task_id = cur.fetchone()["id"]
+            if first_task_id is None:
+                first_task_id = task_id
+        if first_task_id:
+            cur.execute(
+                """
+                INSERT INTO task_segments (day_id, task_id, started_at, source)
+                VALUES (%s, %s, %s, 'start_default')
+                """,
+                (day_id, first_task_id, started_at),
+            )
+    return day_id, started_at
 
 
 def weekly_range(anchor: dt.date):
@@ -522,13 +544,13 @@ def make_dashboard_image(profile, daily, week_total, task_totals, anchor: dt.dat
     return output
 
 
-@bot.tree.command(name="profile", description="Create or update your productivity profile.")
+@bot.tree.command(name="createprofile", description="Create or update your productivity profile.")
 @app_commands.describe(display_name="Profile display name", channel_id="Your manually-created private channel ID")
-async def profile(interaction: discord.Interaction, display_name: str, channel_id: str | None = None):
+async def createprofile(interaction: discord.Interaction, display_name: str, channel_id: str | None = None):
     parsed_channel_id = int(channel_id) if channel_id else None
     ensure_profile(interaction.user, display_name, parsed_channel_id)
     await interaction.response.send_message(
-        f"Profile saved: **{display_name}** | Role: **{ROLE_NAME}**",
+        f"✅ Profile saved: **{display_name}** | Role: **{ROLE_NAME}**",
         ephemeral=True,
     )
 
@@ -536,7 +558,7 @@ async def profile(interaction: discord.Interaction, display_name: str, channel_i
 @bot.tree.command(name="startday", description="Start your productivity day and send today's tasks.")
 async def startday(interaction: discord.Interaction):
     if get_active_day(interaction.user.id):
-        await interaction.response.send_message("You already have an active day. Use `/closeday` first.", ephemeral=True)
+        await interaction.response.send_message("⚠️ You already have an active day. Use `/closeday` first.", ephemeral=True)
         return
 
     await interaction.response.send_modal(StartDayTaskModal())
@@ -546,23 +568,23 @@ async def startday(interaction: discord.Interaction):
 async def closeday(interaction: discord.Interaction):
     day = get_active_day(interaction.user.id)
     if not day:
-        await interaction.response.send_message("You do not have an active day.", ephemeral=True)
+        await interaction.response.send_message("⚠️ You do not have an active day.", ephemeral=True)
         return
 
     closed_at = utc_now()
     db_exec("UPDATE task_segments SET ended_at = %s WHERE day_id = %s AND ended_at IS NULL", (closed_at, day["id"]))
     db_exec("UPDATE work_days SET status = 'closed', closed_at = %s, next_checkin_at = NULL WHERE id = %s", (closed_at, day["id"]))
     total, totals = day_summary(day["id"], closed_at)
-    await interaction.response.send_message(build_summary_text("Day closed", total, totals))
+    await interaction.response.send_message(build_summary_text("✅ Day closed", total, totals))
 
 
-@bot.tree.command(name="stats", description="Show a user's saved profile stats.")
+@bot.tree.command(name="profile", description="Show a user's saved profile stats.")
 @app_commands.describe(user="User to check")
-async def stats(interaction: discord.Interaction, user: discord.Member | None = None):
+async def profile(interaction: discord.Interaction, user: discord.Member | None = None):
     target = user or interaction.user
     profile_row = get_profile(target.id)
     if not profile_row:
-        await interaction.response.send_message("No profile found for that user.", ephemeral=True)
+        await interaction.response.send_message("⚠️ No profile found for that user.", ephemeral=True)
         return
 
     days = db_all(
@@ -575,8 +597,8 @@ async def stats(interaction: discord.Interaction, user: discord.Member | None = 
         total += day_total
     average = total / len(days) if days else dt.timedelta()
     await interaction.response.send_message(
-        f"**{profile_row['display_name']}**\nRole: **{ROLE_NAME}**\n"
-        f"Closed days: **{len(days)}**\nDaily average: **{format_duration(average)}**"
+        f"👤 **{profile_row['display_name']}**\nRole: **{ROLE_NAME}**\n"
+        f"📅 Closed days: **{len(days)}**\n⏱️ Daily average: **{format_duration(average)}**"
     )
 
 
@@ -599,7 +621,7 @@ async def weekly(
     target = user or interaction.user
     profile_row = get_profile(target.id)
     if not profile_row:
-        await interaction.followup.send("No profile found for that user.")
+        await interaction.followup.send("⚠️ No profile found for that user.")
         return
 
     try:
@@ -617,7 +639,7 @@ async def weekly(
 
     if selected_mode == "days":
         if not daily:
-            await interaction.followup.send("No days found for that week.")
+            await interaction.followup.send("📭 No days found for that week.")
             return
         for work_date, total, totals in daily:
             await interaction.followup.send(build_summary_text(str(work_date), total, totals))
@@ -650,7 +672,7 @@ async def daystats(interaction: discord.Interaction, user: discord.Member | None
         (target.id, work_date),
     )
     if not row:
-        await interaction.response.send_message("No day found for that date.", ephemeral=True)
+        await interaction.response.send_message("📭 No day found for that date.", ephemeral=True)
         return
     total, totals = day_summary(row["id"], row["closed_at"] or utc_now())
     await interaction.response.send_message(build_summary_text(str(work_date), total, totals))
@@ -659,7 +681,7 @@ async def daystats(interaction: discord.Interaction, user: discord.Member | None
 @bot.tree.command(name="test_profile", description="Test profile saving.")
 async def test_profile(interaction: discord.Interaction):
     ensure_profile(interaction.user)
-    await interaction.response.send_message("Profile test passed.", ephemeral=True)
+    await interaction.response.send_message("✅ Profile test passed. Use `/createprofile` to set your display name.", ephemeral=True)
 
 
 @bot.tree.command(name="test_startday", description="Test the startday prompt.")
@@ -673,9 +695,9 @@ async def test_startday(interaction: discord.Interaction):
 @bot.tree.command(name="test_checkin", description="Send yourself a check-in using your active day.")
 async def test_checkin(interaction: discord.Interaction):
     if not get_active_day(interaction.user.id):
-        await interaction.response.send_message("Start a day first with `/startday`.", ephemeral=True)
+        await interaction.response.send_message("⚠️ Start a day first with `/startday`.", ephemeral=True)
         return
-    await interaction.response.send_message("Sending test check-in to your DMs.", ephemeral=True)
+    await interaction.response.send_message("📩 Sending test check-in to your DMs.", ephemeral=True)
     await run_checkin(interaction.user.id, "Manual test check-in.")
 
 
@@ -683,7 +705,7 @@ async def test_checkin(interaction: discord.Interaction):
 async def test_closeday(interaction: discord.Interaction):
     day = get_active_day(interaction.user.id)
     if not day:
-        await interaction.response.send_message("No active day to preview.", ephemeral=True)
+        await interaction.response.send_message("⚠️ No active day to preview.", ephemeral=True)
         return
     total, totals = day_summary(day["id"])
     await interaction.response.send_message(build_summary_text("Close day preview", total, totals), ephemeral=True)
@@ -691,6 +713,15 @@ async def test_closeday(interaction: discord.Interaction):
 
 @bot.tree.command(name="test_weekly_image", description="Generate a test weekly dashboard image.")
 async def test_weekly_image(interaction: discord.Interaction):
+    await send_weekly_graph_test(interaction)
+
+
+@bot.tree.command(name="test_weekly_graph", description="Generate a test weekly graph image.")
+async def test_weekly_graph(interaction: discord.Interaction):
+    await send_weekly_graph_test(interaction)
+
+
+async def send_weekly_graph_test(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     profile_row = get_profile(interaction.user.id)
     if not profile_row:
@@ -703,14 +734,21 @@ async def test_weekly_image(interaction: discord.Interaction):
 
 @bot.event
 async def on_ready():
+    global commands_synced
     init_db()
-    global_synced = await bot.tree.sync()
+    global_synced = []
     guild_synced = []
-    if GUILD_ID:
-        guild = discord.Object(id=GUILD_ID)
-        bot.tree.clear_commands(guild=guild)
-        bot.tree.copy_global_to(guild=guild)
-        guild_synced = await bot.tree.sync(guild=guild)
+    if not commands_synced:
+        if GUILD_ID:
+            guild = discord.Object(id=GUILD_ID)
+            bot.tree.clear_commands(guild=guild)
+            bot.tree.copy_global_to(guild=guild)
+            guild_synced = await bot.tree.sync(guild=guild)
+            bot.tree.clear_commands(guild=None)
+            global_synced = await bot.tree.sync()
+        else:
+            global_synced = await bot.tree.sync()
+        commands_synced = True
     if not checkin_scheduler.is_running():
         checkin_scheduler.start()
     print(
