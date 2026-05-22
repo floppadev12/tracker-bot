@@ -291,6 +291,36 @@ async def profile_autocomplete(interaction: discord.Interaction, current: str):
     ]
 
 
+def date_choice_label(row):
+    total, _ = day_summary(row["id"], row["closed_at"] or utc_now())
+    status = "closed" if row["closed_at"] else "active"
+    return f"{row['work_date']} | {format_duration(total)} | {status}"
+
+
+async def work_date_autocomplete(interaction: discord.Interaction, current: str):
+    profile_selector = getattr(interaction.namespace, "profile_name", None)
+    profile_row = get_profile_by_selector(profile_selector, interaction.user.id)
+    if not profile_row:
+        return []
+
+    search = f"{current}%"
+    rows = db_all(
+        """
+        SELECT id, work_date, closed_at
+        FROM work_days
+        WHERE (profile_id = %s OR (profile_id IS NULL AND discord_user_id = %s))
+          AND (%s = '' OR work_date::TEXT LIKE %s)
+        ORDER BY work_date DESC, started_at DESC
+        LIMIT 25
+        """,
+        (profile_row["id"], profile_row["owner_discord_user_id"], current, search),
+    )
+    return [
+        app_commands.Choice(name=date_choice_label(row)[:100], value=str(row["work_date"]))
+        for row in rows
+    ]
+
+
 def get_active_day(profile_id: int):
     return db_one(
         """
@@ -624,21 +654,22 @@ def weekly_range(anchor: dt.date):
     return start, end
 
 
-def weekly_rows(profile_id: int, anchor: dt.date):
+def weekly_rows(profile_row, anchor: dt.date):
     start, end = weekly_range(anchor)
     return db_all(
         """
         SELECT id, work_date, started_at, closed_at, status
         FROM work_days
-        WHERE profile_id = %s AND work_date >= %s AND work_date < %s
+        WHERE (profile_id = %s OR (profile_id IS NULL AND discord_user_id = %s))
+          AND work_date >= %s AND work_date < %s
         ORDER BY work_date ASC, started_at ASC
         """,
-        (profile_id, start, end),
+        (profile_row["id"], profile_row["owner_discord_user_id"], start, end),
     )
 
 
-def weekly_summary(profile_id: int, anchor: dt.date):
-    rows = weekly_rows(profile_id, anchor)
+def weekly_summary(profile_row, anchor: dt.date):
+    rows = weekly_rows(profile_row, anchor)
     daily = []
     task_totals = defaultdict(dt.timedelta)
     week_total = dt.timedelta()
@@ -849,8 +880,13 @@ async def profile(interaction: discord.Interaction, profile_name: str | None = N
         return
 
     days = db_all(
-        "SELECT id, closed_at FROM work_days WHERE profile_id = %s AND status = 'closed'",
-        (profile_row["id"],),
+        """
+        SELECT id, closed_at
+        FROM work_days
+        WHERE (profile_id = %s OR (profile_id IS NULL AND discord_user_id = %s))
+          AND status = 'closed'
+        """,
+        (profile_row["id"], profile_row["owner_discord_user_id"]),
     )
     total = dt.timedelta()
     for row in days:
@@ -868,6 +904,7 @@ async def profile(interaction: discord.Interaction, profile_name: str | None = N
 @bot.tree.command(name="weekly", description="Show weekly productivity stats.")
 @app_commands.describe(profile_name="Saved bot profile to check", mode="How to show the weekly stats", date="Any date in the target week, YYYY-MM-DD")
 @app_commands.autocomplete(profile_name=profile_autocomplete)
+@app_commands.autocomplete(date=work_date_autocomplete)
 @app_commands.choices(
     mode=[
         app_commands.Choice(name="overview_text", value="overview"),
@@ -894,7 +931,7 @@ async def weekly(
         return
 
     selected_mode = mode.value if mode else "overview"
-    daily, week_total, task_totals = weekly_summary(profile_row["id"], anchor)
+    daily, week_total, task_totals = weekly_summary(profile_row, anchor)
     if selected_mode == "image":
         path = make_dashboard_image(profile_row, daily, week_total, task_totals, anchor)
         await interaction.followup.send(file=discord.File(path, filename="weekly-productivity.png"))
@@ -917,6 +954,7 @@ async def weekly(
 @bot.tree.command(name="daystats", description="Show one saved day for a user.")
 @app_commands.describe(profile_name="Saved bot profile to check", date="Day to show, YYYY-MM-DD")
 @app_commands.autocomplete(profile_name=profile_autocomplete)
+@app_commands.autocomplete(date=work_date_autocomplete)
 async def daystats(interaction: discord.Interaction, profile_name: str | None = None, date: str | None = None):
     profile_row = get_profile_by_selector(profile_name, interaction.user.id)
     if not profile_row:
@@ -926,27 +964,39 @@ async def daystats(interaction: discord.Interaction, profile_name: str | None = 
         )
         return
 
-    try:
-        work_date = parse_local_date(date)
-    except ValueError as exc:
-        await interaction.response.send_message(embed=make_embed("Invalid Date", str(exc)), ephemeral=True)
-        return
-
-    row = db_one(
-        """
-        SELECT id, closed_at
-        FROM work_days
-        WHERE profile_id = %s AND work_date = %s
-        ORDER BY started_at DESC
-        LIMIT 1
-        """,
-        (profile_row["id"], work_date),
-    )
+    if date:
+        try:
+            work_date = parse_local_date(date)
+        except ValueError as exc:
+            await interaction.response.send_message(embed=make_embed("Invalid Date", str(exc)), ephemeral=True)
+            return
+        row = db_one(
+            """
+            SELECT id, work_date, closed_at
+            FROM work_days
+            WHERE (profile_id = %s OR (profile_id IS NULL AND discord_user_id = %s))
+              AND work_date = %s
+            ORDER BY started_at DESC
+            LIMIT 1
+            """,
+            (profile_row["id"], profile_row["owner_discord_user_id"], work_date),
+        )
+    else:
+        row = db_one(
+            """
+            SELECT id, work_date, closed_at
+            FROM work_days
+            WHERE profile_id = %s OR (profile_id IS NULL AND discord_user_id = %s)
+            ORDER BY work_date DESC, started_at DESC
+            LIMIT 1
+            """,
+            (profile_row["id"], profile_row["owner_discord_user_id"]),
+        )
     if not row:
         await interaction.response.send_message(embed=make_embed("No Day Found", "📭 No day found for that date."), ephemeral=True)
         return
     total, totals = day_summary(row["id"], row["closed_at"] or utc_now())
-    await interaction.response.send_message(embed=build_summary_embed(str(work_date), total, totals))
+    await interaction.response.send_message(embed=build_summary_embed(str(row["work_date"]), total, totals))
 
 
 @bot.tree.command(name="test", description="Run a productivity bot test.")
@@ -1012,7 +1062,7 @@ async def send_weekly_graph_test(interaction: discord.Interaction):
     profile_row = get_default_profile(interaction.user.id)
     if not profile_row:
         profile_row = ensure_profile(interaction.user)
-    daily, week_total, task_totals = weekly_summary(profile_row["id"], local_now().date())
+    daily, week_total, task_totals = weekly_summary(profile_row, local_now().date())
     path = make_dashboard_image(profile_row, daily, week_total, task_totals, local_now().date())
     await interaction.followup.send(file=discord.File(path, filename="weekly-productivity-test.png"), ephemeral=True)
 
