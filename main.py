@@ -33,7 +33,6 @@ CHECKIN_RETRY_DELAYS = (60, 10, 10, 10)
 MAX_CUSTOM_TASKS = 24
 
 intents = discord.Intents.default()
-intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 conn = None
@@ -297,6 +296,42 @@ class TaskSelect(discord.ui.Select):
         self.view.stop()
 
 
+class StartDayTaskModal(discord.ui.Modal, title="Start productivity day"):
+    task_list = discord.ui.TextInput(
+        label="Today's tasks",
+        placeholder="Write one task per line. Self-care is added automatically.",
+        style=discord.TextStyle.paragraph,
+        min_length=1,
+        max_length=1800,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if get_active_day(interaction.user.id):
+            await interaction.response.send_message("You already have an active day. Use `/closeday` first.", ephemeral=True)
+            return
+
+        ensure_profile(interaction.user)
+        task_names = [line.strip() for line in str(self.task_list).splitlines() if line.strip()]
+        task_names = [name for name in task_names if name.lower() != SELF_CARE_TASK.lower()]
+        if not task_names:
+            await interaction.response.send_message("No tasks found. Start again and enter at least one task.", ephemeral=True)
+            return
+        if len(task_names) > MAX_CUSTOM_TASKS:
+            await interaction.response.send_message(
+                f"Too many tasks. Enter up to {MAX_CUSTOM_TASKS} tasks plus Self-care.",
+                ephemeral=True,
+            )
+            return
+
+        task_names.append(SELF_CARE_TASK)
+        create_day(interaction.user.id, task_names)
+        await interaction.response.send_message(
+            f"Day started with {len(task_names)} tasks. Check your DMs to choose your starting task.",
+            ephemeral=True,
+        )
+        await run_checkin(interaction.user.id, "Choose what you are starting with.")
+
+
 async def ask_task_choice(user: discord.User, day_id: int, reason: str):
     task_rows = get_day_tasks(day_id)
     if not task_rows:
@@ -502,37 +537,7 @@ async def startday(interaction: discord.Interaction):
         await interaction.response.send_message("You already have an active day. Use `/closeday` first.", ephemeral=True)
         return
 
-    ensure_profile(interaction.user)
-    await interaction.response.send_message(
-        "Send today's tasks in this channel now, one task per line. I will add `Self-care` as the last option.",
-        ephemeral=True,
-    )
-
-    def check(message: discord.Message):
-        return message.author.id == interaction.user.id and message.channel.id == interaction.channel_id
-
-    try:
-        message = await bot.wait_for("message", check=check, timeout=300)
-    except asyncio.TimeoutError:
-        await interaction.followup.send("Timed out waiting for your task list.", ephemeral=True)
-        return
-
-    task_names = [line.strip() for line in message.content.splitlines() if line.strip()]
-    task_names = [name for name in task_names if name.lower() != SELF_CARE_TASK.lower()]
-    if not task_names:
-        await interaction.followup.send("No tasks found. Start again and send at least one task.", ephemeral=True)
-        return
-    if len(task_names) > MAX_CUSTOM_TASKS:
-        await interaction.followup.send(f"Too many tasks. Send up to {MAX_CUSTOM_TASKS} tasks plus Self-care.", ephemeral=True)
-        return
-
-    task_names.append(SELF_CARE_TASK)
-    day_id = create_day(interaction.user.id, task_names)
-    await interaction.followup.send(
-        f"Day started with {len(task_names)} tasks. Check your DMs to choose your starting task.",
-        ephemeral=True,
-    )
-    await run_checkin(interaction.user.id, "Choose what you are starting with.")
+    await interaction.response.send_modal(StartDayTaskModal())
 
 
 @bot.tree.command(name="closeday", description="Close your active day and show the time spent per task.")
@@ -658,7 +663,7 @@ async def test_profile(interaction: discord.Interaction):
 @bot.tree.command(name="test_startday", description="Test the startday prompt.")
 async def test_startday(interaction: discord.Interaction):
     await interaction.response.send_message(
-        "Startday test: `/startday` will ask for a multiline task message, then append Self-care.",
+        "Startday test: `/startday` opens a multiline task form, then appends Self-care.",
         ephemeral=True,
     )
 
