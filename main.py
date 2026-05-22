@@ -653,12 +653,12 @@ def weekly_summary(profile_id: int, anchor: dt.date):
 
 
 def get_font(size: int, bold=False):
-    montserrat_path = os.path.join(os.path.dirname(__file__), "assets", "fonts", "Montserrat-Bold.ttf")
-    if os.path.exists(montserrat_path):
+    inter_path = os.path.join(os.path.dirname(__file__), "assets", "fonts", "Inter.ttf")
+    if os.path.exists(inter_path):
         try:
-            font = ImageFont.truetype(montserrat_path, size)
+            font = ImageFont.truetype(inter_path, size)
             try:
-                font.set_variation_by_axes([900])
+                font.set_variation_by_axes([700 if bold else 450])
             except (AttributeError, OSError, ValueError):
                 pass
             return font
@@ -682,24 +682,24 @@ def get_font(size: int, bold=False):
 
 def make_dashboard_image(profile, daily, week_total, task_totals, anchor: dt.date):
     width, height = 1400, 820
-    image = Image.new("RGB", (width, height), "#050b16")
+    image = Image.new("RGB", (width, height), "#0b0f14")
     draw = ImageDraw.Draw(image)
-    title_font = get_font(56, True)
-    metric_font = get_font(46, True)
-    heading_font = get_font(30, True)
-    body_font = get_font(23)
-    small_font = get_font(18)
-    tiny_font = get_font(15)
+    title_font = get_font(48, True)
+    metric_font = get_font(44, True)
+    heading_font = get_font(26, True)
+    body_font = get_font(22)
+    small_font = get_font(17)
+    tiny_font = get_font(14)
 
     for y in range(height):
         for x in range(width):
-            r = 5 + int((x / width) * 8)
-            g = 10 + int((y / height) * 16)
-            b = 24 + int((x / width) * 36) + int((y / height) * 18)
-            image.putpixel((x, y), (r, g, min(78, b)))
+            r = 10 + int((x / width) * 5)
+            g = 14 + int((y / height) * 7)
+            b = 20 + int((x / width) * 9) + int((y / height) * 5)
+            image.putpixel((x, y), (r, g, b))
 
-    def panel(box, fill="#0b1628", outline="#1c3b67"):
-        draw.rounded_rectangle(box, radius=28, fill=fill, outline=outline, width=2)
+    def panel(box, fill="#111820", outline="#2b3642", radius=18):
+        draw.rounded_rectangle(box, radius=radius, fill=fill, outline=outline, width=1)
 
     def gradient_bar(box, color_a, color_b, radius=10):
         x1, y1, x2, y2 = box
@@ -716,23 +716,23 @@ def make_dashboard_image(profile, daily, week_total, task_totals, anchor: dt.dat
         image.paste(grad, (x1, y1), mask)
 
     start, end = weekly_range(anchor)
-    panel((34, 34, 1366, 786), "#071326", "#1e4f87")
-    draw.text((78, 72), "Weekly Productivity", font=title_font, fill="#f7fbff")
+    panel((34, 34, 1366, 786), "#0f151c", "#26313d", 22)
+    draw.text((78, 72), "Weekly Productivity", font=title_font, fill="#f4f6f8")
     draw.text(
-        (82, 140),
+        (82, 132),
         f"{profile['display_name']}  |  {ROLE_NAME}  |  {start} to {end - dt.timedelta(days=1)}",
         font=body_font,
-        fill="#8fb7e8",
+        fill="#9ca7b3",
     )
 
-    panel((940, 72, 1308, 176), "#0d1d35", "#255c99")
-    draw.text((972, 88), format_duration(week_total), font=metric_font, fill="#66c2ff")
-    draw.text((976, 142), "total focused time", font=small_font, fill="#a9bdd4")
+    panel((944, 72, 1308, 176), "#141c24", "#2e3a46", 18)
+    draw.text((976, 88), format_duration(week_total), font=metric_font, fill="#36f0a1")
+    draw.text((980, 142), "total focused time", font=small_font, fill="#9ca7b3")
 
     max_daily = max([total.total_seconds() for _, total, _ in daily] + [1])
     x, y = 82, 246
-    panel((64, 210, 858, 720), "#0a172b", "#193b67")
-    draw.text((x, y - 6), "Daily totals", font=heading_font, fill="#f5f9ff")
+    panel((64, 210, 858, 720), "#111820", "#2b3642", 18)
+    draw.text((x, y - 6), "Daily totals", font=heading_font, fill="#f4f6f8")
     chart_top = y + 58
     chart_bottom = 642
     chart_height = chart_bottom - chart_top
@@ -742,34 +742,34 @@ def make_dashboard_image(profile, daily, week_total, task_totals, anchor: dt.dat
         total = match[1] if match else dt.timedelta()
         bar_h = int((total.total_seconds() / max_daily) * chart_height)
         bx = x + 28 + index * 102
-        draw.rounded_rectangle((bx, chart_top, bx + 58, chart_bottom), radius=16, fill="#0f2541")
+        draw.rounded_rectangle((bx, chart_top, bx + 58, chart_bottom), radius=12, fill="#1a232d")
         if bar_h:
-            gradient_bar((bx, chart_bottom - bar_h, bx + 58, chart_bottom), (47, 129, 247), (102, 194, 255), 16)
-        draw.text((bx + 8, chart_bottom + 18), day.strftime("%a"), font=small_font, fill="#dbe9fb")
+            gradient_bar((bx, chart_bottom - bar_h, bx + 58, chart_bottom), (0, 171, 85), (54, 240, 161), 12)
+        draw.text((bx + 8, chart_bottom + 18), day.strftime("%a"), font=small_font, fill="#d8dee4")
         label = format_duration(total)
         label_w = draw.textbbox((0, 0), label, font=tiny_font)[2]
-        draw.text((bx + 29 - label_w / 2, chart_bottom + 45), label, font=tiny_font, fill="#8fb7e8")
+        draw.text((bx + 29 - label_w / 2, chart_bottom + 45), label, font=tiny_font, fill="#9ca7b3")
 
     tx, ty = 930, 246
-    panel((900, 210, 1308, 720), "#0a172b", "#193b67")
-    draw.text((tx, ty - 6), "Top tasks", font=heading_font, fill="#f5f9ff")
+    panel((900, 210, 1308, 720), "#111820", "#2b3642", 18)
+    draw.text((tx, ty - 6), "Top tasks", font=heading_font, fill="#f4f6f8")
     max_task = max([duration.total_seconds() for duration in task_totals.values()] + [1])
     top_tasks = sorted(task_totals.items(), key=lambda item: item[1], reverse=True)[:7]
     if not top_tasks:
-        draw.text((tx, ty + 68), "No tracked tasks yet", font=body_font, fill="#8fb7e8")
+        draw.text((tx, ty + 68), "No tracked tasks yet", font=body_font, fill="#9ca7b3")
     for index, (task, duration) in enumerate(top_tasks):
         row_y = ty + 62 + index * 58
         name = task if len(task) <= 24 else task[:21] + "..."
-        draw.text((tx, row_y), name, font=body_font, fill="#edf6ff")
+        draw.text((tx, row_y), name, font=body_font, fill="#f4f6f8")
         duration_text = format_duration(duration)
         duration_w = draw.textbbox((0, 0), duration_text, font=small_font)[2]
-        draw.text((1266 - duration_w, row_y + 3), duration_text, font=small_font, fill="#9ecfff")
+        draw.text((1266 - duration_w, row_y + 3), duration_text, font=small_font, fill="#b5bec9")
         bar_w = int((duration.total_seconds() / max_task) * 336)
-        draw.rounded_rectangle((tx, row_y + 34, tx + 336, row_y + 47), radius=7, fill="#102944")
+        draw.rounded_rectangle((tx, row_y + 34, tx + 336, row_y + 47), radius=6, fill="#1e2833")
         if bar_w:
-            gradient_bar((tx, row_y + 34, tx + bar_w, row_y + 47), (88, 166, 255), (53, 229, 255), 7)
+            gradient_bar((tx, row_y + 34, tx + bar_w, row_y + 47), (0, 171, 85), (54, 240, 161), 6)
 
-    draw.text((82, 738), "Generated by the productivity tracker", font=tiny_font, fill="#597797")
+    draw.text((82, 738), "Generated by the productivity tracker", font=tiny_font, fill="#6f7c89")
 
     output = os.path.join(tempfile.gettempdir(), f"productivity_week_{profile['id']}_{anchor}.png")
     image.save(output)
