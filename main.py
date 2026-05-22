@@ -298,7 +298,7 @@ def date_choice_label(row):
 
 
 async def work_date_autocomplete(interaction: discord.Interaction, current: str):
-    profile_selector = getattr(interaction.namespace, "profile_name", None)
+    profile_selector = getattr(interaction.namespace, "profile", None) or getattr(interaction.namespace, "profile_name", None)
     profile_row = get_profile_by_selector(profile_selector, interaction.user.id)
     if not profile_row:
         return []
@@ -819,10 +819,10 @@ async def createprofile(interaction: discord.Interaction, display_name: str, cha
 
 
 @bot.tree.command(name="startday", description="Start your productivity day and send today's tasks.")
-@app_commands.describe(profile_name="Saved bot profile to start")
-@app_commands.autocomplete(profile_name=profile_autocomplete)
-async def startday(interaction: discord.Interaction, profile_name: str | None = None):
-    profile_row = get_profile_by_selector(profile_name, interaction.user.id)
+@app_commands.describe(profile="Saved bot profile to start")
+@app_commands.autocomplete(profile=profile_autocomplete)
+async def startday(interaction: discord.Interaction, profile: str | None = None):
+    profile_row = get_profile_by_selector(profile, interaction.user.id)
     if not profile_row:
         await interaction.response.send_message(
             embed=make_embed("Profile Missing", "Create a profile first with `/createprofile`."),
@@ -841,10 +841,10 @@ async def startday(interaction: discord.Interaction, profile_name: str | None = 
 
 
 @bot.tree.command(name="closeday", description="Close your active day and show the time spent per task.")
-@app_commands.describe(profile_name="Saved bot profile to close")
-@app_commands.autocomplete(profile_name=profile_autocomplete)
-async def closeday(interaction: discord.Interaction, profile_name: str | None = None):
-    profile_row = get_profile_by_selector(profile_name, interaction.user.id)
+@app_commands.describe(profile="Saved bot profile to close")
+@app_commands.autocomplete(profile=profile_autocomplete)
+async def closeday(interaction: discord.Interaction, profile: str | None = None):
+    profile_row = get_profile_by_selector(profile, interaction.user.id)
     if not profile_row:
         await interaction.response.send_message(
             embed=make_embed("Profile Missing", "Create a profile first with `/createprofile`."),
@@ -868,10 +868,10 @@ async def closeday(interaction: discord.Interaction, profile_name: str | None = 
 
 
 @bot.tree.command(name="profile", description="Show a user's saved profile stats.")
-@app_commands.describe(profile_name="Saved bot profile to check")
-@app_commands.autocomplete(profile_name=profile_autocomplete)
-async def profile(interaction: discord.Interaction, profile_name: str | None = None):
-    profile_row = get_profile_by_selector(profile_name, interaction.user.id)
+@app_commands.describe(profile="Saved bot profile to check")
+@app_commands.autocomplete(profile=profile_autocomplete)
+async def profile(interaction: discord.Interaction, profile: str | None = None):
+    profile_row = get_profile_by_selector(profile, interaction.user.id)
     if not profile_row:
         await interaction.response.send_message(
             embed=make_embed("Profile Missing", "⚠️ No profile found for that user."),
@@ -902,8 +902,8 @@ async def profile(interaction: discord.Interaction, profile_name: str | None = N
 
 
 @bot.tree.command(name="weekly", description="Show weekly productivity stats.")
-@app_commands.describe(profile_name="Saved bot profile to check", mode="How to show the weekly stats", date="Any date in the target week, YYYY-MM-DD")
-@app_commands.autocomplete(profile_name=profile_autocomplete)
+@app_commands.describe(profile="Saved bot profile to check", mode="How to show the weekly stats", date="Any date in the target week, YYYY-MM-DD")
+@app_commands.autocomplete(profile=profile_autocomplete)
 @app_commands.autocomplete(date=work_date_autocomplete)
 @app_commands.choices(
     mode=[
@@ -914,12 +914,12 @@ async def profile(interaction: discord.Interaction, profile_name: str | None = N
 )
 async def weekly(
     interaction: discord.Interaction,
-    profile_name: str | None = None,
+    profile: str | None = None,
     mode: app_commands.Choice[str] | None = None,
     date: str | None = None,
 ):
     await interaction.response.defer()
-    profile_row = get_profile_by_selector(profile_name, interaction.user.id)
+    profile_row = get_profile_by_selector(profile, interaction.user.id)
     if not profile_row:
         await interaction.followup.send(embed=make_embed("Profile Missing", "⚠️ No profile found for that user."))
         return
@@ -952,11 +952,11 @@ async def weekly(
 
 
 @bot.tree.command(name="daystats", description="Show one saved day for a user.")
-@app_commands.describe(profile_name="Saved bot profile to check", date="Day to show, YYYY-MM-DD")
-@app_commands.autocomplete(profile_name=profile_autocomplete)
+@app_commands.describe(profile="Saved bot profile to check", date="Day to show, YYYY-MM-DD")
+@app_commands.autocomplete(profile=profile_autocomplete)
 @app_commands.autocomplete(date=work_date_autocomplete)
-async def daystats(interaction: discord.Interaction, profile_name: str | None = None, date: str | None = None):
-    profile_row = get_profile_by_selector(profile_name, interaction.user.id)
+async def daystats(interaction: discord.Interaction, profile: str | None = None, date: str | None = None):
+    profile_row = get_profile_by_selector(profile, interaction.user.id)
     if not profile_row:
         await interaction.response.send_message(
             embed=make_embed("Profile Missing", "⚠️ No profile found for that user."),
