@@ -18,6 +18,7 @@ load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
+DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID")
 
 # Preserved settings from the previous bot.
 PROJECT_NAME = "Project Floppa"
@@ -37,6 +38,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 conn = None
 checkin_locks = set()
+GUILD_ID = int(DISCORD_GUILD_ID) if DISCORD_GUILD_ID else None
 
 
 def utc_now():
@@ -702,10 +704,20 @@ async def test_weekly_image(interaction: discord.Interaction):
 @bot.event
 async def on_ready():
     init_db()
-    synced = await bot.tree.sync()
+    global_synced = await bot.tree.sync()
+    guild_synced = []
+    if GUILD_ID:
+        guild = discord.Object(id=GUILD_ID)
+        bot.tree.clear_commands(guild=guild)
+        bot.tree.copy_global_to(guild=guild)
+        guild_synced = await bot.tree.sync(guild=guild)
     if not checkin_scheduler.is_running():
         checkin_scheduler.start()
-    print(f"{bot.user} is online. Synced {len(synced)} slash command(s).")
+    print(
+        f"{bot.user} is online. "
+        f"Synced {len(global_synced)} global slash command(s)"
+        + (f" and {len(guild_synced)} guild slash command(s)." if GUILD_ID else ".")
+    )
 
 
 def main():
