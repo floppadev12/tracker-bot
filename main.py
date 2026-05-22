@@ -653,6 +653,18 @@ def weekly_summary(profile_id: int, anchor: dt.date):
 
 
 def get_font(size: int, bold=False):
+    montserrat_path = os.path.join(os.path.dirname(__file__), "assets", "fonts", "Montserrat-Bold.ttf")
+    if os.path.exists(montserrat_path):
+        try:
+            font = ImageFont.truetype(montserrat_path, size)
+            try:
+                font.set_variation_by_axes([900])
+            except (AttributeError, OSError, ValueError):
+                pass
+            return font
+        except OSError:
+            pass
+
     names = [
         "C:/Windows/Fonts/segoeuib.ttf" if bold else "C:/Windows/Fonts/segoeui.ttf",
         "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
