@@ -1,4 +1,4 @@
-discord.py
-psycopg2-binary
-python-dotenv
-Pillow
+discord.py>=2.3,<3
+psycopg2-binary>=2.9,<3
+python-dotenv>=1,<2
+Pillow>=10,<12

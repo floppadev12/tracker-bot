@@ -1,26 +1,35 @@
-# Roblox Report Bot
+# Discord Productivity Tracker Bot
 
-A Discord bot for tracking Roblox game projects with:
-- `/project`
-- `/add`
-- `/winrate`
-- `/maintenance`
-- PostgreSQL storage
-- Railway deployment
+A Discord bot for tracking productivity time by Discord account.
 
-## Features implemented
-- Shared projects for one server
-- Ephemeral replies only
-- Create and track projects
-- Manual time tracking per segment
-- Release / Won / Missed confirmation modals
-- Overall / field / format winrate
-- Maintenance actions for fields, formats, segments, project rename, move, status change, reopen, and set segment hours
+## Commands
+
+- `/startday` - start a work day and enter today's task list
+- `/pause` - pause the active timer
+- `/resume` - resume a paused timer by choosing a task
+- `/closeday` - close the active day and show task totals
+- `/profile` - show your own saved stats
+- `/weekly` - show your own weekly stats as text, daily embeds, or an image
+- `/daystats` - show one of your saved days
+- `/test` - run basic bot checks
+
+## Behavior
+
+- Identity is based only on the Discord account that runs the command.
+- There is no separate profile creation or profile selector.
+- Each Discord user can have one active day at a time.
+- Check-ins are sent by DM every 30 minutes while the timer is running.
+- If a check-in is ignored through the retry window, the bot pauses the timer.
+- Clicking a task in a pending check-in resumes counting from the click time.
+- `/pause` and `/resume` can be used manually during the day.
+- On startup, older duplicate active days for the same Discord user are closed automatically so only the newest remains active.
 
 ## Setup
 
 ### 1. Create your Discord bot
+
 In the Discord Developer Portal:
+
 - create a new application
 - add a bot
 - copy the bot token
@@ -34,30 +43,36 @@ In the Discord Developer Portal:
   - Read Message History
 
 ### 2. Railway
+
 Create a new Railway project and add:
+
 - one Python service for the bot
 - one PostgreSQL database
 
-### 3. Environment variables
+### 3. Environment Variables
+
 Set these in Railway:
+
 - `DISCORD_TOKEN`
 - `DISCORD_GUILD_ID`
 - `DATABASE_URL`
-- `MAINTENANCE_ROLE_ID`
 
 ### 4. Deploy
+
 Railway build command:
+
 ```bash
 pip install -r requirements.txt
 ```
 
 Railway start command:
+
 ```bash
 python main.py
 ```
 
 ## Notes
-- Commands are synced to one guild only using `DISCORD_GUILD_ID`
-- Default segments are auto-created if missing: Build, Script, UI, Thumbnail
-- Project and format names are globally unique
-- Select menus support up to 25 options because that is Discord's limit
+
+- Commands are synced to one guild only when `DISCORD_GUILD_ID` is set.
+- `Self-care` is appended automatically to every day.
+- Select menus support up to 25 options because that is Discord's limit.
