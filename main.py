@@ -704,6 +704,17 @@ def weekly_summary(user_id: int, anchor: dt.date):
     return daily, week_total, dict(task_totals)
 
 
+def clear_stats(user_id: int | None = None):
+    if user_id is None:
+        row = db_one("SELECT COUNT(*) AS count FROM work_days")
+        db_exec("DELETE FROM work_days")
+        return row["count"] if row else 0
+
+    row = db_one("SELECT COUNT(*) AS count FROM work_days WHERE discord_user_id = %s", (user_id,))
+    db_exec("DELETE FROM work_days WHERE discord_user_id = %s", (user_id,))
+    return row["count"] if row else 0
+
+
 def get_font(size: int, bold=False):
     inter_path = os.path.join(os.path.dirname(__file__), "assets", "fonts", "Inter.ttf")
     if os.path.exists(inter_path):
@@ -997,6 +1008,33 @@ async def daystats(interaction: discord.Interaction, date: str | None = None):
         return
     total, totals = day_summary(row["id"], row["closed_at"] or utc_now())
     await interaction.response.send_message(embed=build_summary_embed(str(row["work_date"]), total, totals), ephemeral=True)
+
+
+@bot.tree.command(name="clearstats", description="Admin: clear productivity stats for one user or everyone.")
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(user="Discord user to reset. Leave empty to reset everyone.", confirm="Type RESET when clearing everyone.")
+async def clearstats(interaction: discord.Interaction, user: discord.User | None = None, confirm: str | None = None):
+    permissions = getattr(interaction.user, "guild_permissions", None)
+    if not permissions or not permissions.administrator:
+        await interaction.response.send_message(
+            embed=make_embed("Permission Denied", "Only server administrators can clear productivity stats."),
+            ephemeral=True,
+        )
+        return
+
+    if user is None and confirm != "RESET":
+        await interaction.response.send_message(
+            embed=make_embed("Confirmation Required", "To clear stats for everyone, run `/clearstats confirm:RESET`."),
+            ephemeral=True,
+        )
+        return
+
+    deleted_days = clear_stats(user.id if user else None)
+    target = user.display_name if user else "everyone"
+    await interaction.response.send_message(
+        embed=make_embed("Stats Cleared", f"Cleared **{deleted_days}** work day(s) for **{target}**."),
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="test", description="Run a productivity bot test.")
