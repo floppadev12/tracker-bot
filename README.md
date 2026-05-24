@@ -9,7 +9,7 @@ A Discord bot for tracking productivity time by Discord account.
 - `/resume` - resume a paused timer by choosing a task
 - `/closeday` - close the active day and show task totals
 - `/profile` - show your own saved stats
-- `/weekly` - show your own weekly stats as text, daily embeds, or an image
+- `/weekly` - choose a Discord user and show that user's weekly stats as text, daily embeds, or an image
 - `/daystats` - show one of your saved days
 - `/test` - run basic bot checks
 
@@ -18,6 +18,7 @@ A Discord bot for tracking productivity time by Discord account.
 - Identity is based only on the Discord account that runs the command.
 - There is no separate profile creation or profile selector.
 - Each Discord user can have one active day at a time.
+- Slash-command responses are ephemeral, so only the person who ran the command can see them.
 - Check-ins are sent by DM every 30 minutes while the timer is running.
 - If a check-in is ignored through the retry window, the bot pauses the timer.
 - Clicking a task in a pending check-in resumes counting from the click time.

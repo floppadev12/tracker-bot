@@ -275,6 +275,8 @@ def date_choice_label(row):
 
 
 async def work_date_autocomplete(interaction: discord.Interaction, current: str):
+    selected_user = getattr(interaction.namespace, "user", None)
+    target_user_id = selected_user.id if selected_user else interaction.user.id
     search = f"{current}%"
     rows = db_all(
         """
@@ -285,7 +287,7 @@ async def work_date_autocomplete(interaction: discord.Interaction, current: str)
         ORDER BY work_date DESC, started_at DESC
         LIMIT 25
         """,
-        (interaction.user.id, current, search),
+        (target_user_id, current, search),
     )
     return [
         app_commands.Choice(name=date_choice_label(row)[:100], value=str(row["work_date"]))
@@ -852,7 +854,7 @@ async def closeday(interaction: discord.Interaction):
     db_exec("UPDATE task_segments SET ended_at = %s WHERE day_id = %s AND ended_at IS NULL", (closed_at, day["id"]))
     db_exec("UPDATE work_days SET status = 'closed', closed_at = %s, paused_at = NULL, next_checkin_at = NULL WHERE id = %s", (closed_at, day["id"]))
     total, totals = day_summary(day["id"], closed_at)
-    await interaction.response.send_message(embed=build_summary_embed("✅ Day Closed", total, totals))
+    await interaction.response.send_message(embed=build_summary_embed("✅ Day Closed", total, totals), ephemeral=True)
 
 
 @bot.tree.command(name="pause", description="Pause your active productivity timer.")
@@ -909,12 +911,13 @@ async def profile(interaction: discord.Interaction):
         embed=make_embed(
             f"{interaction.user.display_name}",
             f"Closed days: **{len(days)}**\nDaily average: **{format_duration(average)}**",
-        )
+        ),
+        ephemeral=True,
     )
 
 
 @bot.tree.command(name="weekly", description="Show weekly productivity stats.")
-@app_commands.describe(mode="How to show the weekly stats", date="Any date in the target week, YYYY-MM-DD")
+@app_commands.describe(user="Discord user whose stats to show", mode="How to show the weekly stats", date="Any date in the target week, YYYY-MM-DD")
 @app_commands.autocomplete(date=work_date_autocomplete)
 @app_commands.choices(
     mode=[
@@ -925,10 +928,11 @@ async def profile(interaction: discord.Interaction):
 )
 async def weekly(
     interaction: discord.Interaction,
+    user: discord.User,
     mode: app_commands.Choice[str] | None = None,
     date: str | None = None,
 ):
-    await interaction.response.defer()
+    await interaction.response.defer(ephemeral=True)
     try:
         anchor = parse_local_date(date)
     except ValueError as exc:
@@ -936,24 +940,24 @@ async def weekly(
         return
 
     selected_mode = mode.value if mode else "overview"
-    daily, week_total, task_totals = weekly_summary(interaction.user.id, anchor)
+    daily, week_total, task_totals = weekly_summary(user.id, anchor)
     if selected_mode == "image":
-        path = make_dashboard_image(interaction.user.display_name, interaction.user.id, daily, week_total, task_totals, anchor)
-        await interaction.followup.send(file=discord.File(path, filename="weekly-productivity.png"))
+        path = make_dashboard_image(user.display_name, user.id, daily, week_total, task_totals, anchor)
+        await interaction.followup.send(file=discord.File(path, filename="weekly-productivity.png"), ephemeral=True)
         return
 
     if selected_mode == "days":
         if not daily:
-            await interaction.followup.send(embed=make_embed("No Days Found", "📭 No days found for that week."))
+            await interaction.followup.send(embed=make_embed("No Days Found", "📭 No days found for that week."), ephemeral=True)
             return
         for work_date, total, totals in daily:
-            await interaction.followup.send(embed=build_summary_embed(str(work_date), total, totals))
+            await interaction.followup.send(embed=build_summary_embed(str(work_date), total, totals), ephemeral=True)
         return
 
     start, end = weekly_range(anchor)
-    text = build_summary_text(f"Week {start} to {end - dt.timedelta(days=1)}", week_total, task_totals)
+    text = build_summary_text(f"{user.display_name} | Week {start} to {end - dt.timedelta(days=1)}", week_total, task_totals)
     for chunk in split_discord_messages(text):
-        await interaction.followup.send(embed=make_embed("Weekly Overview", chunk))
+        await interaction.followup.send(embed=make_embed("Weekly Overview", chunk), ephemeral=True)
 
 
 @bot.tree.command(name="daystats", description="Show one saved day for a user.")
@@ -992,7 +996,7 @@ async def daystats(interaction: discord.Interaction, date: str | None = None):
         await interaction.response.send_message(embed=make_embed("No Day Found", "📭 No day found for that date."), ephemeral=True)
         return
     total, totals = day_summary(row["id"], row["closed_at"] or utc_now())
-    await interaction.response.send_message(embed=build_summary_embed(str(row["work_date"]), total, totals))
+    await interaction.response.send_message(embed=build_summary_embed(str(row["work_date"]), total, totals), ephemeral=True)
 
 
 @bot.tree.command(name="test", description="Run a productivity bot test.")
