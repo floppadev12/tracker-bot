@@ -119,7 +119,8 @@ def init_db():
             id SERIAL PRIMARY KEY,
             day_id INTEGER NOT NULL REFERENCES work_days(id) ON DELETE CASCADE,
             name TEXT NOT NULL,
-            sort_order INTEGER NOT NULL
+            sort_order INTEGER NOT NULL,
+            removed_at TIMESTAMPTZ
         );
 
         CREATE TABLE IF NOT EXISTS task_segments (
@@ -144,6 +145,8 @@ def init_db():
     migrate_profile_schema()
     if not table_has_column("work_days", "paused_at"):
         db_exec("ALTER TABLE work_days ADD COLUMN paused_at TIMESTAMPTZ")
+    if not table_has_column("day_tasks", "removed_at"):
+        db_exec("ALTER TABLE day_tasks ADD COLUMN removed_at TIMESTAMPTZ")
     db_exec(
         """
         WITH duplicate_active AS (
@@ -309,8 +312,72 @@ def get_active_day(user_id: int):
 
 def get_day_tasks(day_id: int):
     return db_all(
-        "SELECT * FROM day_tasks WHERE day_id = %s ORDER BY sort_order ASC",
+        "SELECT * FROM day_tasks WHERE day_id = %s AND removed_at IS NULL ORDER BY sort_order ASC",
         (day_id,),
+    )
+
+
+async def active_task_autocomplete(interaction: discord.Interaction, current: str):
+    day = get_active_day(interaction.user.id)
+    if not day:
+        return []
+
+    search = current.lower()
+    rows = [
+        row for row in get_day_tasks(day["id"])
+        if not search or search in row["name"].lower()
+    ][:25]
+    return [
+        app_commands.Choice(name=row["name"][:100], value=str(row["id"]))
+        for row in rows
+    ]
+
+
+def get_day_task(day_id: int, task_id: int):
+    return db_one(
+        "SELECT * FROM day_tasks WHERE day_id = %s AND id = %s AND removed_at IS NULL",
+        (day_id, task_id),
+    )
+
+
+def get_day_task_by_name(day_id: int, name: str):
+    return db_one(
+        """
+        SELECT *
+        FROM day_tasks
+        WHERE day_id = %s
+          AND lower(name) = lower(%s)
+          AND removed_at IS NULL
+        LIMIT 1
+        """,
+        (day_id, name),
+    )
+
+
+def add_task_to_day(day_id: int, name: str):
+    row = db_one(
+        "SELECT COALESCE(MAX(sort_order), 0) + 1 AS next_sort_order FROM day_tasks WHERE day_id = %s",
+        (day_id,),
+    )
+    sort_order = row["next_sort_order"] if row else 1
+    return db_one(
+        """
+        INSERT INTO day_tasks (day_id, name, sort_order)
+        VALUES (%s, %s, %s)
+        RETURNING *
+        """,
+        (day_id, name, sort_order),
+    )
+
+
+def remove_task_from_day(day_id: int, task_id: int, when: dt.datetime):
+    db_exec(
+        """
+        UPDATE day_tasks
+        SET removed_at = %s
+        WHERE day_id = %s AND id = %s AND removed_at IS NULL
+        """,
+        (when, day_id, task_id),
     )
 
 
@@ -559,25 +626,23 @@ async def ask_task_choice(user: discord.User, day_id: int, reason: str):
         except asyncio.TimeoutError:
             prompt = "Still need your current task"
             if attempt == 1:
-                reason = "No answer yet. I will ask a few quick times before pausing your timer."
+                reason = "No answer yet. I will ask a few quick times, then keep your current task running."
             else:
                 reason = "Quick retry."
         except discord.Forbidden:
-            pause_day(day_id, utc_now())
-            return None, "dm_blocked_paused", None
+            return None, "dm_blocked_continued", None
 
-    pause_day(day_id, utc_now())
     try:
         await user.send(
             embed=make_embed(
-                "Productivity Paused",
-                "I paused your timer because you did not answer the check-in. Pick a task from any check-in message to resume.",
+                "Check-in Missed",
+                "No answer received. I kept your current task running and will ask again at the next check-in.",
             )
         )
     except discord.Forbidden:
-        return None, "dm_blocked_paused", None
+        return None, "dm_blocked_continued", None
 
-    return None, "auto_paused", None
+    return None, "unanswered_continued", None
 
 
 async def run_checkin(user_id: int, reason: str, segment_started_at: dt.datetime | None = None):
@@ -609,6 +674,8 @@ async def run_checkin(user_id: int, reason: str, segment_started_at: dt.datetime
             (day["id"], task_id, asked_at, answered_at, source),
         )
         if task_id and source != "answered_after_pause":
+            set_next_checkin(day["id"], utc_now() + CHECKIN_INTERVAL)
+        elif source in {"unanswered_continued", "dm_blocked_continued"}:
             set_next_checkin(day["id"], utc_now() + CHECKIN_INTERVAL)
     finally:
         checkin_locks.discard(user_id)
@@ -880,6 +947,61 @@ async def pause(interaction: discord.Interaction):
 
     pause_day(day["id"], utc_now())
     await interaction.response.send_message(embed=make_embed("Paused", "Your productivity timer is paused."), ephemeral=True)
+
+
+@bot.tree.command(name="addtask", description="Add a task to your active day.")
+@app_commands.describe(name="Task name to add")
+async def addtask(interaction: discord.Interaction, name: str):
+    day = get_active_day(interaction.user.id)
+    if not day:
+        await interaction.response.send_message(embed=make_embed("No Active Day", "You do not have an active day."), ephemeral=True)
+        return
+
+    task_name = name.strip()
+    if not task_name:
+        await interaction.response.send_message(embed=make_embed("Invalid Task", "Task name cannot be empty."), ephemeral=True)
+        return
+    if len(task_name) > 100:
+        await interaction.response.send_message(embed=make_embed("Task Too Long", "Use a task name of 100 characters or fewer."), ephemeral=True)
+        return
+    if len(get_day_tasks(day["id"])) >= 25:
+        await interaction.response.send_message(embed=make_embed("Task Limit Reached", "A day can have up to 25 active tasks."), ephemeral=True)
+        return
+    if get_day_task_by_name(day["id"], task_name):
+        await interaction.response.send_message(embed=make_embed("Task Exists", f"**{task_name}** is already on today's task list."), ephemeral=True)
+        return
+
+    add_task_to_day(day["id"], task_name)
+    await interaction.response.send_message(embed=make_embed("Task Added", f"Added **{task_name}** to today's task list."), ephemeral=True)
+
+
+@bot.tree.command(name="removetask", description="Remove a task from your active day.")
+@app_commands.describe(task="Task to remove")
+@app_commands.autocomplete(task=active_task_autocomplete)
+async def removetask(interaction: discord.Interaction, task: str):
+    day = get_active_day(interaction.user.id)
+    if not day:
+        await interaction.response.send_message(embed=make_embed("No Active Day", "You do not have an active day."), ephemeral=True)
+        return
+
+    task_row = None
+    try:
+        task_row = get_day_task(day["id"], int(task))
+    except ValueError:
+        task_row = get_day_task_by_name(day["id"], task.strip())
+
+    if not task_row:
+        await interaction.response.send_message(embed=make_embed("Task Not Found", "That task is not on today's active task list."), ephemeral=True)
+        return
+    if task_row["name"].lower() == SELF_CARE_TASK.lower():
+        await interaction.response.send_message(embed=make_embed("Cannot Remove Self-care", "Self-care stays on every day automatically."), ephemeral=True)
+        return
+    if len(get_day_tasks(day["id"])) <= 1:
+        await interaction.response.send_message(embed=make_embed("Cannot Remove Last Task", "Keep at least one task on the day."), ephemeral=True)
+        return
+
+    remove_task_from_day(day["id"], task_row["id"], utc_now())
+    await interaction.response.send_message(embed=make_embed("Task Removed", f"Removed **{task_row['name']}** from future check-ins."), ephemeral=True)
 
 
 @bot.tree.command(name="resume", description="Resume your paused productivity timer.")
