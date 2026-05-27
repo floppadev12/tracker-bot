@@ -601,8 +601,7 @@ class StartDayTaskModal(discord.ui.Modal, title="Start productivity day"):
             embed=make_embed(
                 f"Welcome back, {self.user.display_name}",
                 f"👋 Day started with **{len(task_names)}** tasks.\nCheck your DMs to choose what you are starting with.",
-            ),
-            ephemeral=True,
+            )
         )
         asyncio.create_task(run_checkin(self.user.id, "Choose what you are starting with.", started_at))
 
@@ -932,7 +931,7 @@ async def closeday(interaction: discord.Interaction):
     db_exec("UPDATE task_segments SET ended_at = %s WHERE day_id = %s AND ended_at IS NULL", (closed_at, day["id"]))
     db_exec("UPDATE work_days SET status = 'closed', closed_at = %s, paused_at = NULL, next_checkin_at = NULL WHERE id = %s", (closed_at, day["id"]))
     total, totals = day_summary(day["id"], closed_at)
-    await interaction.response.send_message(embed=build_summary_embed("✅ Day Closed", total, totals), ephemeral=True)
+    await interaction.response.send_message(embed=build_summary_embed("✅ Day Closed", total, totals))
 
 
 @bot.tree.command(name="pause", description="Pause your active productivity timer.")
