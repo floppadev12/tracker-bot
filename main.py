@@ -23,6 +23,7 @@ DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID")
 # Preserved settings from the previous bot.
 PROJECT_NAME = "Project Floppa"
 REPORT_CHANNEL_ID = 1490317756136947942
+WEEKLY_DASHBOARD_CHANNEL_ID = 1509800687871987732
 TIMEZONE = "Europe/Bratislava"
 USD_PER_ROBUX = 0.0038
 EMBED_COLOR = discord.Color(0xFFF9EB)
@@ -39,6 +40,7 @@ conn = None
 checkin_locks = set()
 GUILD_ID = int(DISCORD_GUILD_ID) if DISCORD_GUILD_ID else None
 commands_synced = False
+last_weekly_dashboard_post_date = None
 
 
 def utc_now():
@@ -770,15 +772,97 @@ def weekly_summary(user_id: int, anchor: dt.date):
     return daily, week_total, dict(task_totals)
 
 
-def clear_stats(user_id: int | None = None):
-    if user_id is None:
-        row = db_one("SELECT COUNT(*) AS count FROM work_days")
-        db_exec("DELETE FROM work_days")
-        return row["count"] if row else 0
+def clear_stats(user_id: int | None = None, scope: str = "all", anchor: dt.date | None = None):
+    params = []
+    where_parts = []
+    if user_id is not None:
+        where_parts.append("discord_user_id = %s")
+        params.append(user_id)
 
-    row = db_one("SELECT COUNT(*) AS count FROM work_days WHERE discord_user_id = %s", (user_id,))
-    db_exec("DELETE FROM work_days WHERE discord_user_id = %s", (user_id,))
+    if scope == "day":
+        target_date = anchor or local_now().date()
+        where_parts.append("work_date = %s")
+        params.append(target_date)
+    elif scope == "week":
+        start, end = weekly_range(anchor or local_now().date())
+        where_parts.append("work_date >= %s AND work_date < %s")
+        params.extend([start, end])
+    elif scope != "all":
+        raise ValueError("Invalid clear scope.")
+
+    where_sql = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    row = db_one(f"SELECT COUNT(*) AS count FROM work_days{where_sql}", tuple(params))
+    db_exec(f"DELETE FROM work_days{where_sql}", tuple(params))
     return row["count"] if row else 0
+
+
+def users_with_weekly_stats(anchor: dt.date):
+    start, end = weekly_range(anchor)
+    return db_all(
+        """
+        SELECT DISTINCT discord_user_id
+        FROM work_days
+        WHERE discord_user_id IS NOT NULL
+          AND work_date >= %s AND work_date < %s
+        ORDER BY discord_user_id ASC
+        """,
+        (start, end),
+    )
+
+
+async def post_weekly_dashboards(anchor: dt.date):
+    channel = bot.get_channel(WEEKLY_DASHBOARD_CHANNEL_ID)
+    if channel is None:
+        channel = await bot.fetch_channel(WEEKLY_DASHBOARD_CHANNEL_ID)
+
+    rows = users_with_weekly_stats(anchor)
+    start, end = weekly_range(anchor)
+    if not rows:
+        await channel.send(
+            embed=make_embed(
+                "Weekly Dashboards",
+                f"No tracked stats found for {start} to {end - dt.timedelta(days=1)}.",
+            )
+        )
+        return
+
+    await channel.send(
+        embed=make_embed(
+            "Weekly Dashboards",
+            f"Posting dashboard images for {start} to {end - dt.timedelta(days=1)}.",
+        )
+    )
+    for row in rows:
+        user_id = row["discord_user_id"]
+        try:
+            user = bot.get_user(user_id) or await bot.fetch_user(user_id)
+            display_name = user.display_name
+        except discord.DiscordException:
+            display_name = f"User {user_id}"
+
+        daily, week_total, task_totals = weekly_summary(user_id, anchor)
+        path = make_dashboard_image(display_name, user_id, daily, week_total, task_totals, anchor)
+        await channel.send(
+            content=f"Weekly dashboard for **{display_name}**",
+            file=discord.File(path, filename=f"weekly-productivity-{user_id}.png"),
+        )
+
+
+@discord_tasks.loop(minutes=1)
+async def weekly_dashboard_scheduler():
+    global last_weekly_dashboard_post_date
+    now = local_now()
+    today = now.date()
+    if now.weekday() != 6 or now.hour != 20 or now.minute != 0:
+        return
+    if last_weekly_dashboard_post_date == today:
+        return
+
+    last_weekly_dashboard_post_date = today
+    try:
+        await post_weekly_dashboards(today)
+    except Exception as exc:
+        print(f"Weekly dashboard post failed: {exc}")
 
 
 def get_font(size: int, bold=False):
@@ -1131,10 +1215,29 @@ async def daystats(interaction: discord.Interaction, date: str | None = None):
     await interaction.response.send_message(embed=build_summary_embed(str(row["work_date"]), total, totals), ephemeral=True)
 
 
-@bot.tree.command(name="clearstats", description="Admin: clear productivity stats for one user or everyone.")
+@bot.tree.command(name="clearstats", description="Admin: clear productivity stats by day, week, or all time.")
 @app_commands.default_permissions(administrator=True)
-@app_commands.describe(user="Discord user to reset. Leave empty to reset everyone.", confirm="Type RESET when clearing everyone.")
-async def clearstats(interaction: discord.Interaction, user: discord.User | None = None, confirm: str | None = None):
+@app_commands.describe(
+    scope="Stats range to clear",
+    user="Discord user to reset. Leave empty to reset everyone.",
+    date="Target day or any date in the target week, YYYY-MM-DD. Defaults to today.",
+    confirm="Type RESET when clearing everyone.",
+)
+@app_commands.autocomplete(date=work_date_autocomplete)
+@app_commands.choices(
+    scope=[
+        app_commands.Choice(name="clear_day", value="day"),
+        app_commands.Choice(name="clear_week", value="week"),
+        app_commands.Choice(name="clear_all", value="all"),
+    ]
+)
+async def clearstats(
+    interaction: discord.Interaction,
+    scope: app_commands.Choice[str],
+    user: discord.User | None = None,
+    date: str | None = None,
+    confirm: str | None = None,
+):
     permissions = getattr(interaction.user, "guild_permissions", None)
     if not permissions or not permissions.administrator:
         await interaction.response.send_message(
@@ -1145,15 +1248,28 @@ async def clearstats(interaction: discord.Interaction, user: discord.User | None
 
     if user is None and confirm != "RESET":
         await interaction.response.send_message(
-            embed=make_embed("Confirmation Required", "To clear stats for everyone, run `/clearstats confirm:RESET`."),
+            embed=make_embed("Confirmation Required", "To clear stats for everyone, include `confirm:RESET`."),
             ephemeral=True,
         )
         return
 
-    deleted_days = clear_stats(user.id if user else None)
+    try:
+        anchor = parse_local_date(date) if scope.value in {"day", "week"} else None
+    except ValueError as exc:
+        await interaction.response.send_message(embed=make_embed("Invalid Date", str(exc)), ephemeral=True)
+        return
+
+    deleted_days = clear_stats(user.id if user else None, scope.value, anchor)
     target = user.display_name if user else "everyone"
+    if scope.value == "day":
+        scope_text = f"day {anchor}"
+    elif scope.value == "week":
+        start, end = weekly_range(anchor)
+        scope_text = f"week {start} to {end - dt.timedelta(days=1)}"
+    else:
+        scope_text = "all time"
     await interaction.response.send_message(
-        embed=make_embed("Stats Cleared", f"Cleared **{deleted_days}** work day(s) for **{target}**."),
+        embed=make_embed("Stats Cleared", f"Cleared **{deleted_days}** work day(s) for **{target}** in **{scope_text}**."),
         ephemeral=True,
     )
 
@@ -1254,6 +1370,8 @@ async def on_ready():
         commands_synced = True
     if not checkin_scheduler.is_running():
         checkin_scheduler.start()
+    if not weekly_dashboard_scheduler.is_running():
+        weekly_dashboard_scheduler.start()
     print(
         f"{bot.user} is online. "
         f"Synced {len(global_synced)} global slash command(s)"
