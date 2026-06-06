@@ -335,6 +335,80 @@ async def active_task_autocomplete(interaction: discord.Interaction, current: st
     ]
 
 
+def get_latest_closed_day(user_id: int):
+    return db_one(
+        """
+        SELECT *
+        FROM work_days
+        WHERE discord_user_id = %s AND status = 'closed'
+        ORDER BY work_date DESC, started_at DESC
+        LIMIT 1
+        """,
+        (user_id,),
+    )
+
+
+def get_user_day_by_date(user_id: int, work_date: dt.date):
+    return db_one(
+        """
+        SELECT *
+        FROM work_days
+        WHERE discord_user_id = %s
+          AND work_date = %s
+        ORDER BY started_at DESC
+        LIMIT 1
+        """,
+        (user_id, work_date),
+    )
+
+
+def get_day_task_time_rows(day_id: int, end_at=None):
+    end_at = end_at or utc_now()
+    return db_all(
+        """
+        SELECT
+            t.id,
+            t.name,
+            SUM(EXTRACT(EPOCH FROM (COALESCE(s.ended_at, %s) - s.started_at))) AS seconds
+        FROM day_tasks t
+        JOIN task_segments s ON s.task_id = t.id
+        WHERE t.day_id = %s
+        GROUP BY t.id, t.name, t.sort_order
+        HAVING SUM(EXTRACT(EPOCH FROM (COALESCE(s.ended_at, %s) - s.started_at))) > 0
+        ORDER BY t.sort_order ASC
+        """,
+        (end_at, day_id, end_at),
+    )
+
+
+async def saved_task_autocomplete(interaction: discord.Interaction, current: str):
+    day = None
+    selected_date = getattr(interaction.namespace, "date", None)
+    if selected_date:
+        try:
+            day = get_user_day_by_date(interaction.user.id, parse_local_date(selected_date))
+        except ValueError:
+            return []
+    else:
+        day = get_latest_closed_day(interaction.user.id)
+
+    if not day:
+        return []
+
+    search = current.lower()
+    rows = [
+        row for row in get_day_task_time_rows(day["id"], day["closed_at"] or utc_now())
+        if not search or search in row["name"].lower()
+    ][:25]
+    return [
+        app_commands.Choice(
+            name=f"{row['name']} | {format_duration(dt.timedelta(seconds=int(row['seconds'])))}"[:100],
+            value=str(row["id"]),
+        )
+        for row in rows
+    ]
+
+
 def get_day_task(day_id: int, task_id: int):
     return db_one(
         "SELECT * FROM day_tasks WHERE day_id = %s AND id = %s AND removed_at IS NULL",
@@ -354,6 +428,24 @@ def get_day_task_by_name(day_id: int, name: str):
         """,
         (day_id, name),
     )
+
+
+def get_saved_day_task(day_id: int, task: str):
+    try:
+        task_id = int(task)
+    except ValueError:
+        return db_one(
+            """
+            SELECT *
+            FROM day_tasks
+            WHERE day_id = %s
+              AND lower(name) = lower(%s)
+            LIMIT 1
+            """,
+            (day_id, task.strip()),
+        )
+
+    return db_one("SELECT * FROM day_tasks WHERE day_id = %s AND id = %s", (day_id, task_id))
 
 
 def add_task_to_day(day_id: int, name: str):
@@ -381,6 +473,59 @@ def remove_task_from_day(day_id: int, task_id: int, when: dt.datetime):
         """,
         (when, day_id, task_id),
     )
+
+
+def remove_time_from_task(day_id: int, task_id: int, duration: dt.timedelta):
+    seconds_to_remove = int(duration.total_seconds())
+    if seconds_to_remove <= 0:
+        return dt.timedelta()
+
+    connection = get_conn()
+    previous_autocommit = connection.autocommit
+    removed_seconds = 0
+    try:
+        connection.autocommit = False
+        with connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, started_at, ended_at
+                FROM task_segments
+                WHERE day_id = %s
+                  AND task_id = %s
+                  AND ended_at IS NOT NULL
+                ORDER BY ended_at DESC, id DESC
+                FOR UPDATE
+                """,
+                (day_id, task_id),
+            )
+            rows = cur.fetchall()
+            for row in rows:
+                if seconds_to_remove <= 0:
+                    break
+
+                segment_seconds = int((row["ended_at"] - row["started_at"]).total_seconds())
+                if segment_seconds <= 0:
+                    continue
+
+                if segment_seconds <= seconds_to_remove:
+                    cur.execute("DELETE FROM task_segments WHERE id = %s", (row["id"],))
+                    removed_seconds += segment_seconds
+                    seconds_to_remove -= segment_seconds
+                    continue
+
+                new_end = row["ended_at"] - dt.timedelta(seconds=seconds_to_remove)
+                cur.execute("UPDATE task_segments SET ended_at = %s WHERE id = %s", (new_end, row["id"]))
+                removed_seconds += seconds_to_remove
+                seconds_to_remove = 0
+
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.autocommit = previous_autocommit
+
+    return dt.timedelta(seconds=removed_seconds)
 
 
 def get_open_segment(day_id: int):
@@ -1213,6 +1358,59 @@ async def daystats(interaction: discord.Interaction, date: str | None = None):
         return
     total, totals = day_summary(row["id"], row["closed_at"] or utc_now())
     await interaction.response.send_message(embed=build_summary_embed(str(row["work_date"]), total, totals), ephemeral=True)
+
+
+@bot.tree.command(name="removehours", description="Remove tracked hours from a task on a finished day.")
+@app_commands.describe(
+    date="Finished day to edit, YYYY-MM-DD",
+    task="Task to remove time from",
+    hours="Hours to remove, for example 1.5",
+)
+@app_commands.autocomplete(date=work_date_autocomplete, task=saved_task_autocomplete)
+async def removehours(
+    interaction: discord.Interaction,
+    date: str,
+    task: str,
+    hours: app_commands.Range[float, 0.01, 1000.0],
+):
+    try:
+        work_date = parse_local_date(date)
+    except ValueError as exc:
+        await interaction.response.send_message(embed=make_embed("Invalid Date", str(exc)), ephemeral=True)
+        return
+
+    day = get_user_day_by_date(interaction.user.id, work_date)
+    if not day:
+        await interaction.response.send_message(embed=make_embed("No Day Found", "No saved day was found for that date."), ephemeral=True)
+        return
+    if day["status"] != "closed":
+        await interaction.response.send_message(embed=make_embed("Day Not Finished", "Use `/closeday` before removing hours from this day."), ephemeral=True)
+        return
+
+    task_row = get_saved_day_task(day["id"], task)
+    if not task_row:
+        await interaction.response.send_message(embed=make_embed("Task Not Found", "That task was not found on the selected day."), ephemeral=True)
+        return
+
+    before_rows = get_day_task_time_rows(day["id"], day["closed_at"])
+    before_seconds = next((int(row["seconds"]) for row in before_rows if row["id"] == task_row["id"]), 0)
+    if before_seconds <= 0:
+        await interaction.response.send_message(embed=make_embed("No Time Found", "That task has no tracked time to remove."), ephemeral=True)
+        return
+
+    requested = dt.timedelta(seconds=int(round(hours * 3600)))
+    removed = remove_time_from_task(day["id"], task_row["id"], requested)
+    total, totals = day_summary(day["id"], day["closed_at"])
+    description = (
+        f"Removed **{format_duration(removed)}** from **{task_row['name']}** on **{day['work_date']}**.\n"
+        f"Day total is now **{format_duration(total)}**."
+    )
+    if removed < requested:
+        description += f"\nThat task only had **{format_duration(dt.timedelta(seconds=before_seconds))}** available."
+
+    embed = build_summary_embed("Hours Removed", total, totals)
+    embed.description = description
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="clearstats", description="Admin: clear productivity stats by day, week, or all time.")

@@ -13,6 +13,7 @@ A Discord bot for tracking productivity time by Discord account.
 - `/profile` - show your own saved stats
 - `/weekly` - choose a Discord user and show that user's weekly stats as text, daily embeds, or an image
 - `/daystats` - show one of your saved days
+- `/removehours` - remove tracked hours from a task on a finished day
 - `/clearstats` - admin-only reset for one user's stats or everyone
 - `/test` - run basic bot checks
 
@@ -28,6 +29,7 @@ A Discord bot for tracking productivity time by Discord account.
 - Clicking a task in a pending check-in resumes counting from the click time.
 - `/pause` and `/resume` can be used manually during the day.
 - `/removetask` hides a task from future check-ins without deleting tracked history for that task.
+- `/removehours` edits a closed day by subtracting time from the selected task's latest saved segments.
 - On startup, older duplicate active days for the same Discord user are closed automatically so only the newest remains active.
 
 ## Setup
