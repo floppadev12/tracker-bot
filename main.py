@@ -528,6 +528,22 @@ def remove_time_from_task(day_id: int, task_id: int, duration: dt.timedelta):
     return dt.timedelta(seconds=removed_seconds)
 
 
+def add_time_to_task(day_id: int, task_id: int, end_at: dt.datetime, duration: dt.timedelta):
+    seconds_to_add = int(duration.total_seconds())
+    if seconds_to_add <= 0:
+        return dt.timedelta()
+
+    started_at = end_at - dt.timedelta(seconds=seconds_to_add)
+    db_exec(
+        """
+        INSERT INTO task_segments (day_id, task_id, started_at, ended_at, source)
+        VALUES (%s, %s, %s, %s, %s)
+        """,
+        (day_id, task_id, started_at, end_at, "manual_addhours"),
+    )
+    return dt.timedelta(seconds=seconds_to_add)
+
+
 def get_open_segment(day_id: int):
     return db_one(
         """
@@ -1409,6 +1425,51 @@ async def removehours(
         description += f"\nThat task only had **{format_duration(dt.timedelta(seconds=before_seconds))}** available."
 
     embed = build_summary_embed("Hours Removed", total, totals)
+    embed.description = description
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="addhours", description="Add tracked hours to a task on a finished day.")
+@app_commands.describe(
+    date="Finished day to edit, YYYY-MM-DD",
+    task="Task to add time to",
+    hours="Hours to add, for example 1.5",
+)
+@app_commands.autocomplete(date=work_date_autocomplete, task=saved_task_autocomplete)
+async def addhours(
+    interaction: discord.Interaction,
+    date: str,
+    task: str,
+    hours: app_commands.Range[float, 0.01, 1000.0],
+):
+    try:
+        work_date = parse_local_date(date)
+    except ValueError as exc:
+        await interaction.response.send_message(embed=make_embed("Invalid Date", str(exc)), ephemeral=True)
+        return
+
+    day = get_user_day_by_date(interaction.user.id, work_date)
+    if not day:
+        await interaction.response.send_message(embed=make_embed("No Day Found", "No saved day was found for that date."), ephemeral=True)
+        return
+    if day["status"] != "closed":
+        await interaction.response.send_message(embed=make_embed("Day Not Finished", "Use `/closeday` before adding hours to this day."), ephemeral=True)
+        return
+
+    task_row = get_saved_day_task(day["id"], task)
+    if not task_row:
+        await interaction.response.send_message(embed=make_embed("Task Not Found", "That task was not found on the selected day."), ephemeral=True)
+        return
+
+    requested = dt.timedelta(seconds=int(round(hours * 3600)))
+    added = add_time_to_task(day["id"], task_row["id"], day["closed_at"], requested)
+    total, totals = day_summary(day["id"], day["closed_at"])
+    description = (
+        f"Added **{format_duration(added)}** to **{task_row['name']}** on **{day['work_date']}**.\n"
+        f"Day total is now **{format_duration(total)}**."
+    )
+
+    embed = build_summary_embed("Hours Added", total, totals)
     embed.description = description
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
