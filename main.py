@@ -1,5 +1,6 @@
 import asyncio
 import datetime as dt
+import json
 import os
 import tempfile
 from collections import defaultdict
@@ -19,6 +20,9 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID")
+GOOGLE_DOCS_DOCUMENT_ID = os.getenv("GOOGLE_DOCS_DOCUMENT_ID")
+GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
 # Preserved settings from the previous bot.
 PROJECT_NAME = "Project Floppa"
@@ -38,9 +42,11 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 conn = None
 checkin_locks = set()
+docs_sync_locks = defaultdict(asyncio.Lock)
 GUILD_ID = int(DISCORD_GUILD_ID) if DISCORD_GUILD_ID else None
 commands_synced = False
 last_weekly_dashboard_post_date = None
+docs_sync_unavailable_logged = False
 
 
 def utc_now():
@@ -147,6 +153,10 @@ def init_db():
     migrate_profile_schema()
     if not table_has_column("work_days", "paused_at"):
         db_exec("ALTER TABLE work_days ADD COLUMN paused_at TIMESTAMPTZ")
+    if not table_has_column("work_days", "google_doc_tab_id"):
+        db_exec("ALTER TABLE work_days ADD COLUMN google_doc_tab_id TEXT")
+    if not table_has_column("work_days", "google_doc_content"):
+        db_exec("ALTER TABLE work_days ADD COLUMN google_doc_content TEXT")
     if not table_has_column("day_tasks", "removed_at"):
         db_exec("ALTER TABLE day_tasks ADD COLUMN removed_at TIMESTAMPTZ")
     db_exec(
@@ -317,6 +327,10 @@ def get_day_tasks(day_id: int):
         "SELECT * FROM day_tasks WHERE day_id = %s AND removed_at IS NULL ORDER BY sort_order ASC",
         (day_id,),
     )
+
+
+def get_all_day_tasks(day_id: int):
+    return db_all("SELECT * FROM day_tasks WHERE day_id = %s ORDER BY sort_order ASC", (day_id,))
 
 
 async def active_task_autocomplete(interaction: discord.Interaction, current: str):
@@ -693,6 +707,151 @@ def split_discord_messages(text: str, limit=1900):
     return chunks
 
 
+def google_docs_enabled():
+    return bool(GOOGLE_DOCS_DOCUMENT_ID and (GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_FILE))
+
+
+def get_google_docs_service():
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+
+    scopes = ["https://www.googleapis.com/auth/documents"]
+    if GOOGLE_SERVICE_ACCOUNT_JSON:
+        service_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        credentials = service_account.Credentials.from_service_account_info(service_info, scopes=scopes)
+    else:
+        credentials = service_account.Credentials.from_service_account_file(GOOGLE_SERVICE_ACCOUNT_FILE, scopes=scopes)
+    return build("docs", "v1", credentials=credentials, cache_discovery=False)
+
+
+def google_tab_title(day):
+    work_date = day["work_date"]
+    if isinstance(work_date, dt.datetime):
+        work_date = work_date.date()
+    return f"{work_date.isoformat()} #{day['id']}"
+
+
+def build_google_doc_day_content(day_id: int):
+    day = db_one("SELECT * FROM work_days WHERE id = %s", (day_id,))
+    if not day:
+        raise ValueError(f"Day {day_id} was not found.")
+
+    closed_at = day["closed_at"]
+    is_closed = day["status"] == "closed" and closed_at is not None
+    tasks = get_all_day_tasks(day_id)
+    totals = {}
+    total = dt.timedelta()
+    if is_closed:
+        total, totals = day_summary(day_id, closed_at)
+
+    work_date = day["work_date"]
+    if isinstance(work_date, dt.datetime):
+        work_date = work_date.date()
+
+    lines = [
+        work_date.strftime("%A, %B %d, %Y"),
+        "",
+        f"Status: {'Closed' if is_closed else 'Active'}",
+    ]
+    if is_closed:
+        lines.append(f"Total worked: {format_duration(total)}")
+    lines.append("")
+    lines.append("Tasks")
+
+    if not tasks:
+        lines.append("- No tasks")
+    for task in tasks:
+        duration = totals.get(task["name"], dt.timedelta())
+        if is_closed:
+            lines.append(f"- {task['name']} - {format_duration(duration)}")
+        else:
+            lines.append(f"- {task['name']}")
+
+    lines.append("")
+    lines.append(f"Tracker day ID: {day_id}")
+    return "\n".join(lines) + "\n"
+
+
+def find_google_doc_tab(document, tab_id: str):
+    pending = list(document.get("tabs", []))
+    while pending:
+        tab = pending.pop(0)
+        if tab.get("tabProperties", {}).get("tabId") == tab_id:
+            return tab
+        pending.extend(tab.get("childTabs", []))
+    return None
+
+
+def replace_google_doc_tab_content(service, document_id: str, tab_id: str, content: str):
+    document = service.documents().get(documentId=document_id, includeTabsContent=True).execute()
+    tab = find_google_doc_tab(document, tab_id)
+    if not tab:
+        raise ValueError(f"Google Docs tab {tab_id} was not found.")
+
+    body = tab.get("documentTab", {}).get("body", {})
+    structural_content = body.get("content", [])
+    end_index = structural_content[-1]["endIndex"] if structural_content else 1
+    requests = []
+    if end_index > 2:
+        requests.append(
+            {
+                "deleteContentRange": {
+                    "range": {
+                        "segmentId": "",
+                        "tabId": tab_id,
+                        "startIndex": 1,
+                        "endIndex": end_index - 1,
+                    }
+                }
+            }
+        )
+    requests.append({"insertText": {"text": content, "endOfSegmentLocation": {"segmentId": "", "tabId": tab_id}}})
+    service.documents().batchUpdate(documentId=document_id, body={"requests": requests}).execute()
+
+
+def sync_google_doc_day_blocking(day_id: int):
+    if not google_docs_enabled():
+        return False
+
+    day = db_one("SELECT * FROM work_days WHERE id = %s", (day_id,))
+    if not day:
+        return False
+
+    service = get_google_docs_service()
+    tab_id = day["google_doc_tab_id"]
+    if not tab_id:
+        response = (
+            service.documents()
+            .batchUpdate(
+                documentId=GOOGLE_DOCS_DOCUMENT_ID,
+                body={"requests": [{"addDocumentTab": {"tabProperties": {"title": google_tab_title(day)}}}]},
+            )
+            .execute()
+        )
+        tab_id = response["replies"][0]["addDocumentTab"]["tabProperties"]["tabId"]
+        db_exec("UPDATE work_days SET google_doc_tab_id = %s WHERE id = %s", (tab_id, day_id))
+
+    content = build_google_doc_day_content(day_id)
+    replace_google_doc_tab_content(service, GOOGLE_DOCS_DOCUMENT_ID, tab_id, content)
+    db_exec("UPDATE work_days SET google_doc_content = %s WHERE id = %s", (content, day_id))
+    return True
+
+
+async def sync_google_doc_day(day_id: int):
+    global docs_sync_unavailable_logged
+    if not google_docs_enabled():
+        if not docs_sync_unavailable_logged:
+            print("Google Docs sync is disabled. Set GOOGLE_DOCS_DOCUMENT_ID and Google service account credentials.")
+            docs_sync_unavailable_logged = True
+        return False
+    async with docs_sync_locks[day_id]:
+        try:
+            return await asyncio.to_thread(sync_google_doc_day_blocking, day_id)
+        except Exception as exc:
+            print(f"Google Docs sync failed for day {day_id}: {exc}")
+            return False
+
+
 class TaskSelectView(discord.ui.View):
     def __init__(self, task_rows, prompt: str, future: asyncio.Future | None = None, day_id: int | None = None):
         super().__init__(timeout=None)
@@ -766,6 +925,7 @@ class StartDayTaskModal(discord.ui.Modal, title="Start productivity day"):
                 f"👋 Day started with **{len(task_names)}** tasks.\nCheck your DMs to choose what you are starting with.",
             )
         )
+        asyncio.create_task(sync_google_doc_day(day_id))
         asyncio.create_task(run_checkin(self.user.id, "Choose what you are starting with.", started_at))
 
 
@@ -1172,11 +1332,16 @@ async def closeday(interaction: discord.Interaction):
         )
         return
 
+    await interaction.response.defer()
     closed_at = utc_now()
     db_exec("UPDATE task_segments SET ended_at = %s WHERE day_id = %s AND ended_at IS NULL", (closed_at, day["id"]))
     db_exec("UPDATE work_days SET status = 'closed', closed_at = %s, paused_at = NULL, next_checkin_at = NULL WHERE id = %s", (closed_at, day["id"]))
     total, totals = day_summary(day["id"], closed_at)
-    await interaction.response.send_message(embed=build_summary_embed("✅ Day Closed", total, totals))
+    docs_synced = await sync_google_doc_day(day["id"])
+    embed = build_summary_embed("✅ Day Closed", total, totals)
+    if google_docs_enabled() and not docs_synced:
+        embed.set_footer(text="Google Docs sync failed. Check the bot logs.")
+    await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="pause", description="Pause your active productivity timer.")
@@ -1217,6 +1382,7 @@ async def addtask(interaction: discord.Interaction, name: str):
 
     add_task_to_day(day["id"], task_name)
     await interaction.response.send_message(embed=make_embed("Task Added", f"Added **{task_name}** to today's task list."), ephemeral=True)
+    asyncio.create_task(sync_google_doc_day(day["id"]))
 
 
 @bot.tree.command(name="removetask", description="Remove a task from your active day.")
@@ -1427,6 +1593,7 @@ async def removehours(
     embed = build_summary_embed("Hours Removed", total, totals)
     embed.description = description
     await interaction.response.send_message(embed=embed, ephemeral=True)
+    asyncio.create_task(sync_google_doc_day(day["id"]))
 
 
 @bot.tree.command(name="addhours", description="Add tracked hours to a task on a finished day.")
@@ -1472,6 +1639,7 @@ async def addhours(
     embed = build_summary_embed("Hours Added", total, totals)
     embed.description = description
     await interaction.response.send_message(embed=embed, ephemeral=True)
+    asyncio.create_task(sync_google_doc_day(day["id"]))
 
 
 @bot.tree.command(name="clearstats", description="Admin: clear productivity stats by day, week, or all time.")
