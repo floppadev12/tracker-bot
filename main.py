@@ -157,6 +157,8 @@ def init_db():
         db_exec("ALTER TABLE work_days ADD COLUMN google_doc_tab_id TEXT")
     if not table_has_column("work_days", "google_doc_content"):
         db_exec("ALTER TABLE work_days ADD COLUMN google_doc_content TEXT")
+    if not table_has_column("work_days", "end_day_recap"):
+        db_exec("ALTER TABLE work_days ADD COLUMN end_day_recap TEXT")
     if not table_has_column("day_tasks", "removed_at"):
         db_exec("ALTER TABLE day_tasks ADD COLUMN removed_at TIMESTAMPTZ")
     db_exec(
@@ -744,20 +746,7 @@ def build_google_doc_day_content(day_id: int):
     if is_closed:
         total, totals = day_summary(day_id, closed_at)
 
-    work_date = day["work_date"]
-    if isinstance(work_date, dt.datetime):
-        work_date = work_date.date()
-
-    lines = [
-        work_date.strftime("%A, %B %d, %Y"),
-        "",
-        f"Status: {'Closed' if is_closed else 'Active'}",
-    ]
-    if is_closed:
-        lines.append(f"Total worked: {format_duration(total)}")
-    lines.append("")
-    lines.append("Tasks")
-
+    lines = ["AGENDA:", ""]
     if not tasks:
         lines.append("- No tasks")
     for task in tasks:
@@ -767,9 +756,43 @@ def build_google_doc_day_content(day_id: int):
         else:
             lines.append(f"- {task['name']}")
 
-    lines.append("")
-    lines.append(f"Tracker day ID: {day_id}")
+    lines.extend(["", "", "END OF THE DAY RECAP:", ""])
+    recap = (day.get("end_day_recap") or "").strip()
+    if recap:
+        lines.append(recap)
     return "\n".join(lines) + "\n"
+
+
+def google_doc_text_style(bold: bool | None = None, font_size: int | None = None):
+    style = {}
+    fields = []
+    if bold is not None:
+        style["bold"] = bold
+        fields.append("bold")
+    if font_size is not None:
+        style["fontSize"] = {"magnitude": font_size, "unit": "PT"}
+        fields.append("fontSize")
+    return style, ",".join(fields)
+
+
+def google_doc_style_ranges(content: str):
+    ranges = []
+    agenda = "AGENDA:"
+    recap = "END OF THE DAY RECAP:"
+
+    agenda_start = content.index(agenda)
+    agenda_end = agenda_start + len(agenda)
+    ranges.append((agenda_start, agenda_end, True, 14))
+
+    task_start = content.index("\n\n") + 2
+    recap_start = content.index(recap)
+    task_end = max(task_start, recap_start - 2)
+    if task_end > task_start:
+        ranges.append((task_start, task_end, False, 14))
+
+    recap_end = recap_start + len(recap)
+    ranges.append((recap_start, recap_end, True, 14))
+    return ranges
 
 
 def find_google_doc_tab(document, tab_id: str):
@@ -805,7 +828,18 @@ def replace_google_doc_tab_content(service, document_id: str, tab_id: str, conte
                 }
             }
         )
-    requests.append({"insertText": {"text": content, "endOfSegmentLocation": {"segmentId": "", "tabId": tab_id}}})
+    requests.append({"insertText": {"text": content, "location": {"segmentId": "", "tabId": tab_id, "index": 1}}})
+    for start, end, bold, font_size in google_doc_style_ranges(content):
+        text_style, fields = google_doc_text_style(bold=bold, font_size=font_size)
+        requests.append(
+            {
+                "updateTextStyle": {
+                    "range": {"segmentId": "", "tabId": tab_id, "startIndex": start + 1, "endIndex": end + 1},
+                    "textStyle": text_style,
+                    "fields": fields,
+                }
+            }
+        )
     service.documents().batchUpdate(documentId=document_id, body={"requests": requests}).execute()
 
 
@@ -927,6 +961,67 @@ class StartDayTaskModal(discord.ui.Modal, title="Start productivity day"):
         )
         asyncio.create_task(sync_google_doc_day(day_id))
         asyncio.create_task(run_checkin(self.user.id, "Choose what you are starting with.", started_at))
+
+
+class CloseDayRecapModal(discord.ui.Modal, title="End day recap"):
+    def __init__(self, user_id: int, day_id: int):
+        super().__init__()
+        self.user_id = user_id
+        self.day_id = day_id
+
+    recap = discord.ui.TextInput(
+        label="End of the day recap",
+        placeholder="Write what happened today, notes for each task, blockers, wins, or what to continue tomorrow.",
+        style=discord.TextStyle.paragraph,
+        min_length=1,
+        max_length=3500,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(embed=make_embed("Not Your Day", "Only the user who started this day can close it."), ephemeral=True)
+            return
+
+        day = get_active_day(self.user_id)
+        if not day or day["id"] != self.day_id:
+            await interaction.response.send_message(embed=make_embed("No Active Day", "That productivity day is no longer active."), ephemeral=True)
+            return
+
+        await interaction.response.defer()
+        closed_at = utc_now()
+        db_exec("UPDATE task_segments SET ended_at = %s WHERE day_id = %s AND ended_at IS NULL", (closed_at, self.day_id))
+        db_exec(
+            """
+            UPDATE work_days
+            SET status = 'closed',
+                closed_at = %s,
+                paused_at = NULL,
+                next_checkin_at = NULL,
+                end_day_recap = %s
+            WHERE id = %s
+            """,
+            (closed_at, str(self.recap).strip(), self.day_id),
+        )
+        total, totals = day_summary(self.day_id, closed_at)
+        docs_synced = await sync_google_doc_day(self.day_id)
+        embed = build_summary_embed("✅ Day Closed", total, totals)
+        if google_docs_enabled() and not docs_synced:
+            embed.set_footer(text="Google Docs sync failed. Check the bot logs.")
+        await interaction.followup.send(embed=embed)
+
+
+class CloseDayRecapView(discord.ui.View):
+    def __init__(self, user_id: int, day_id: int):
+        super().__init__(timeout=600)
+        self.user_id = user_id
+        self.day_id = day_id
+
+    @discord.ui.button(label="Write recap and close day", style=discord.ButtonStyle.primary)
+    async def write_recap(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(embed=make_embed("Not Your Day", "Only the user who started this day can close it."), ephemeral=True)
+            return
+        await interaction.response.send_modal(CloseDayRecapModal(self.user_id, self.day_id))
 
 
 async def ask_task_choice(user: discord.User, day_id: int, reason: str):
@@ -1332,16 +1427,14 @@ async def closeday(interaction: discord.Interaction):
         )
         return
 
-    await interaction.response.defer()
-    closed_at = utc_now()
-    db_exec("UPDATE task_segments SET ended_at = %s WHERE day_id = %s AND ended_at IS NULL", (closed_at, day["id"]))
-    db_exec("UPDATE work_days SET status = 'closed', closed_at = %s, paused_at = NULL, next_checkin_at = NULL WHERE id = %s", (closed_at, day["id"]))
-    total, totals = day_summary(day["id"], closed_at)
-    docs_synced = await sync_google_doc_day(day["id"])
-    embed = build_summary_embed("✅ Day Closed", total, totals)
-    if google_docs_enabled() and not docs_synced:
-        embed.set_footer(text="Google Docs sync failed. Check the bot logs.")
-    await interaction.followup.send(embed=embed)
+    task_rows = get_day_tasks(day["id"])
+    task_lines = [f"{index}. {task['name']}" for index, task in enumerate(task_rows, start=1)]
+    description = "Today's tasks:\n" + "\n".join(task_lines)
+    await interaction.response.send_message(
+        embed=make_embed("End Day Recap", description[:4096]),
+        view=CloseDayRecapView(interaction.user.id, day["id"]),
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="pause", description="Pause your active productivity timer.")
