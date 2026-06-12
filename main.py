@@ -778,7 +778,7 @@ def build_google_doc_day_content(day_id: int):
     agenda_line = "AGENDA:"
     if is_closed:
         agenda_line += f" [Total worked {format_duration(total)}]"
-    lines = [title_line, "", agenda_line, ""]
+    lines = [title_line, "", "", agenda_line, ""]
     duration_ranges = []
     if not tasks:
         lines.append("- No tasks")
@@ -851,7 +851,7 @@ def google_doc_style_ranges(content: str, duration_ranges):
     ranges.append((recap_start, recap_end, {"bold": True, "font_size": 14}))
     recap_body_start = recap_end + 2
     if len(content) > recap_body_start:
-        ranges.append((recap_body_start, len(content) - 1, {"bold": False}))
+        ranges.append((recap_body_start, len(content) - 1, {"bold": False, "font_size": 14}))
     return ranges
 
 
