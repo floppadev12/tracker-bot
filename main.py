@@ -776,7 +776,7 @@ def build_google_doc_day_content(day_id: int):
 
     agenda_line = "AGENDA:"
     if is_closed:
-        agenda_line += f" Total worked {format_duration(total)}"
+        agenda_line += f" [Total worked {format_duration(total)}]"
     lines = [agenda_line, ""]
     duration_ranges = []
     if not tasks:
