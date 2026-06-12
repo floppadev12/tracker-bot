@@ -20,11 +20,13 @@ A Discord bot for tracking productivity time by Discord account.
 
 ## Google Docs Sync
 
-When configured, the bot syncs each productivity day to one Google document:
+When configured, the bot syncs each productivity day to the Google document assigned to that Discord user:
 
-- `/startday` creates a new tab in the configured Google Doc
+- dooly (`334414804477411339`) syncs to `GOOGLE_DOCS_DOCUMENT_ID_DOOLY`
+- koszan (`695348265289383967`) syncs to `GOOGLE_DOCS_DOCUMENT_ID_KOSZAN`
+- `/startday` creates a new tab in that user's configured Google Doc
 - `/addtask` updates that day's tab with the new task
-- `/closeday` updates the same tab with the final time spent on each task
+- `/closeday` asks for an end day recap, then updates the same tab with task times and the recap
 
 The bot still uses Postgres as the source of truth. Google Docs is treated as a synced report.
 
@@ -76,7 +78,8 @@ Set these in Railway:
 - `DISCORD_TOKEN`
 - `DISCORD_GUILD_ID`
 - `DATABASE_URL`
-- `GOOGLE_DOCS_DOCUMENT_ID`
+- `GOOGLE_DOCS_DOCUMENT_ID_DOOLY`
+- `GOOGLE_DOCS_DOCUMENT_ID_KOSZAN`
 - `GOOGLE_SERVICE_ACCOUNT_JSON`
 
 For Google Docs:
@@ -84,7 +87,7 @@ For Google Docs:
 - create a Google Cloud service account
 - enable the Google Docs API
 - copy the service account JSON into `GOOGLE_SERVICE_ACCOUNT_JSON`
-- share the target Google Doc with the service account email as an editor
+- share both target Google Docs with the service account email as an editor
 
 ### 4. Deploy
 

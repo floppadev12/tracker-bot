@@ -21,6 +21,8 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 DISCORD_GUILD_ID = os.getenv("DISCORD_GUILD_ID")
 GOOGLE_DOCS_DOCUMENT_ID = os.getenv("GOOGLE_DOCS_DOCUMENT_ID")
+GOOGLE_DOCS_DOCUMENT_ID_DOOLY = os.getenv("GOOGLE_DOCS_DOCUMENT_ID_DOOLY")
+GOOGLE_DOCS_DOCUMENT_ID_KOSZAN = os.getenv("GOOGLE_DOCS_DOCUMENT_ID_KOSZAN")
 GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
@@ -36,6 +38,10 @@ SELF_CARE_TASK = "Self-care"
 CHECKIN_INTERVAL = dt.timedelta(minutes=30)
 CHECKIN_RETRY_DELAYS = (60, 10, 10, 10)
 MAX_CUSTOM_TASKS = 24
+GOOGLE_DOC_USERS = {
+    334414804477411339: ("dooly", GOOGLE_DOCS_DOCUMENT_ID_DOOLY),
+    695348265289383967: ("koszan", GOOGLE_DOCS_DOCUMENT_ID_KOSZAN),
+}
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -155,6 +161,8 @@ def init_db():
         db_exec("ALTER TABLE work_days ADD COLUMN paused_at TIMESTAMPTZ")
     if not table_has_column("work_days", "google_doc_tab_id"):
         db_exec("ALTER TABLE work_days ADD COLUMN google_doc_tab_id TEXT")
+    if not table_has_column("work_days", "google_doc_document_id"):
+        db_exec("ALTER TABLE work_days ADD COLUMN google_doc_document_id TEXT")
     if not table_has_column("work_days", "google_doc_content"):
         db_exec("ALTER TABLE work_days ADD COLUMN google_doc_content TEXT")
     if not table_has_column("work_days", "end_day_recap"):
@@ -710,7 +718,8 @@ def split_discord_messages(text: str, limit=1900):
 
 
 def google_docs_enabled():
-    return bool(GOOGLE_DOCS_DOCUMENT_ID and (GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_FILE))
+    has_document = bool(GOOGLE_DOCS_DOCUMENT_ID or GOOGLE_DOCS_DOCUMENT_ID_DOOLY or GOOGLE_DOCS_DOCUMENT_ID_KOSZAN)
+    return bool(has_document and (GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_FILE))
 
 
 def get_google_docs_service():
@@ -726,11 +735,31 @@ def get_google_docs_service():
     return build("docs", "v1", credentials=credentials, cache_discovery=False)
 
 
+def google_doc_user_config(discord_user_id: int | None):
+    name, document_id = GOOGLE_DOC_USERS.get(discord_user_id, (None, None))
+    return name, document_id or GOOGLE_DOCS_DOCUMENT_ID
+
+
 def google_tab_title(day):
     work_date = day["work_date"]
     if isinstance(work_date, dt.datetime):
         work_date = work_date.date()
-    return f"{work_date.isoformat()} #{day['id']}"
+    user_name, _ = google_doc_user_config(day.get("discord_user_id"))
+    suffix = f" {user_name}" if user_name else ""
+    return f"{work_date.strftime('%d/%m/%Y')}{suffix}"
+
+
+def google_rgb_color(hex_color: str):
+    value = hex_color.lstrip("#")
+    return {
+        "color": {
+            "rgbColor": {
+                "red": int(value[0:2], 16) / 255,
+                "green": int(value[2:4], 16) / 255,
+                "blue": int(value[4:6], 16) / 255,
+            }
+        }
+    }
 
 
 def build_google_doc_day_content(day_id: int):
@@ -747,12 +776,17 @@ def build_google_doc_day_content(day_id: int):
         total, totals = day_summary(day_id, closed_at)
 
     lines = ["AGENDA:", ""]
+    duration_ranges = []
     if not tasks:
         lines.append("- No tasks")
     for task in tasks:
         duration = totals.get(task["name"], dt.timedelta())
         if is_closed:
-            lines.append(f"- {task['name']} - {format_duration(duration)}")
+            duration_text = format_duration(duration)
+            line = f"- {task['name']} {duration_text}"
+            start = sum(len(existing) + 1 for existing in lines) + len(line) - len(duration_text)
+            duration_ranges.append((start, start + len(duration_text)))
+            lines.append(line)
         else:
             lines.append(f"- {task['name']}")
 
@@ -760,10 +794,15 @@ def build_google_doc_day_content(day_id: int):
     recap = (day.get("end_day_recap") or "").strip()
     if recap:
         lines.append(recap)
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines) + "\n", duration_ranges
 
 
-def google_doc_text_style(bold: bool | None = None, font_size: int | None = None):
+def google_doc_text_style(
+    bold: bool | None = None,
+    font_size: int | None = None,
+    foreground: str | None = None,
+    background: str | None = None,
+):
     style = {}
     fields = []
     if bold is not None:
@@ -772,26 +811,38 @@ def google_doc_text_style(bold: bool | None = None, font_size: int | None = None
     if font_size is not None:
         style["fontSize"] = {"magnitude": font_size, "unit": "PT"}
         fields.append("fontSize")
+    if foreground is not None:
+        style["foregroundColor"] = google_rgb_color(foreground)
+        fields.append("foregroundColor")
+    if background is not None:
+        style["backgroundColor"] = google_rgb_color(background)
+        fields.append("backgroundColor")
     return style, ",".join(fields)
 
 
-def google_doc_style_ranges(content: str):
+def google_doc_style_ranges(content: str, duration_ranges):
     ranges = []
     agenda = "AGENDA:"
     recap = "END OF THE DAY RECAP:"
 
     agenda_start = content.index(agenda)
     agenda_end = agenda_start + len(agenda)
-    ranges.append((agenda_start, agenda_end, True, 14))
+    ranges.append((agenda_start, agenda_end, {"bold": True, "font_size": 14}))
 
     task_start = content.index("\n\n") + 2
     recap_start = content.index(recap)
     task_end = max(task_start, recap_start - 2)
     if task_end > task_start:
-        ranges.append((task_start, task_end, False, 14))
+        ranges.append((task_start, task_end, {"bold": False, "font_size": 14}))
+
+    for start, end in duration_ranges:
+        ranges.append((start, end, {"foreground": "#980000", "background": "#ffdada"}))
 
     recap_end = recap_start + len(recap)
-    ranges.append((recap_start, recap_end, True, 14))
+    ranges.append((recap_start, recap_end, {"bold": True, "font_size": 14}))
+    recap_body_start = recap_end + 2
+    if len(content) > recap_body_start:
+        ranges.append((recap_body_start, len(content) - 1, {"bold": False}))
     return ranges
 
 
@@ -805,7 +856,7 @@ def find_google_doc_tab(document, tab_id: str):
     return None
 
 
-def replace_google_doc_tab_content(service, document_id: str, tab_id: str, content: str):
+def replace_google_doc_tab_content(service, document_id: str, tab_id: str, content: str, duration_ranges):
     document = service.documents().get(documentId=document_id, includeTabsContent=True).execute()
     tab = find_google_doc_tab(document, tab_id)
     if not tab:
@@ -829,8 +880,8 @@ def replace_google_doc_tab_content(service, document_id: str, tab_id: str, conte
             }
         )
     requests.append({"insertText": {"text": content, "location": {"segmentId": "", "tabId": tab_id, "index": 1}}})
-    for start, end, bold, font_size in google_doc_style_ranges(content):
-        text_style, fields = google_doc_text_style(bold=bold, font_size=font_size)
+    for start, end, style_options in google_doc_style_ranges(content, duration_ranges):
+        text_style, fields = google_doc_text_style(**style_options)
         requests.append(
             {
                 "updateTextStyle": {
@@ -850,23 +901,32 @@ def sync_google_doc_day_blocking(day_id: int):
     day = db_one("SELECT * FROM work_days WHERE id = %s", (day_id,))
     if not day:
         return False
+    _, document_id = google_doc_user_config(day.get("discord_user_id"))
+    if not document_id:
+        print(f"Google Docs sync skipped for day {day_id}: no document configured for user {day.get('discord_user_id')}.")
+        return False
 
     service = get_google_docs_service()
     tab_id = day["google_doc_tab_id"]
+    if day.get("google_doc_document_id") and day["google_doc_document_id"] != document_id:
+        tab_id = None
     if not tab_id:
         response = (
             service.documents()
             .batchUpdate(
-                documentId=GOOGLE_DOCS_DOCUMENT_ID,
+                documentId=document_id,
                 body={"requests": [{"addDocumentTab": {"tabProperties": {"title": google_tab_title(day)}}}]},
             )
             .execute()
         )
         tab_id = response["replies"][0]["addDocumentTab"]["tabProperties"]["tabId"]
-        db_exec("UPDATE work_days SET google_doc_tab_id = %s WHERE id = %s", (tab_id, day_id))
+        db_exec(
+            "UPDATE work_days SET google_doc_tab_id = %s, google_doc_document_id = %s WHERE id = %s",
+            (tab_id, document_id, day_id),
+        )
 
-    content = build_google_doc_day_content(day_id)
-    replace_google_doc_tab_content(service, GOOGLE_DOCS_DOCUMENT_ID, tab_id, content)
+    content, duration_ranges = build_google_doc_day_content(day_id)
+    replace_google_doc_tab_content(service, document_id, tab_id, content, duration_ranges)
     db_exec("UPDATE work_days SET google_doc_content = %s WHERE id = %s", (content, day_id))
     return True
 
@@ -875,7 +935,7 @@ async def sync_google_doc_day(day_id: int):
     global docs_sync_unavailable_logged
     if not google_docs_enabled():
         if not docs_sync_unavailable_logged:
-            print("Google Docs sync is disabled. Set GOOGLE_DOCS_DOCUMENT_ID and Google service account credentials.")
+            print("Google Docs sync is disabled. Set per-user Google Docs document IDs and Google service account credentials.")
             docs_sync_unavailable_logged = True
         return False
     async with docs_sync_locks[day_id]:
