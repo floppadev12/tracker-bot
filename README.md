@@ -106,5 +106,4 @@ python main.py
 ## Notes
 
 - Commands are synced to one guild only when `DISCORD_GUILD_ID` is set.
-- `Self-care` is appended automatically to every day.
 - Select menus support up to 25 options because that is Discord's limit.

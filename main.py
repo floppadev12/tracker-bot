@@ -34,10 +34,9 @@ TIMEZONE = "Europe/Bratislava"
 USD_PER_ROBUX = 0.0038
 EMBED_COLOR = discord.Color(0xFFF9EB)
 
-SELF_CARE_TASK = "Self-care"
 CHECKIN_INTERVAL = dt.timedelta(minutes=30)
 CHECKIN_RETRY_DELAYS = (60, 10, 10, 10)
-MAX_CUSTOM_TASKS = 24
+MAX_CUSTOM_TASKS = 25
 GOOGLE_DOC_USERS = {
     334414804477411339: ("dooly", GOOGLE_DOCS_DOCUMENT_ID_DOOLY),
     695348265289383967: ("koszan", GOOGLE_DOCS_DOCUMENT_ID_KOSZAN),
@@ -982,7 +981,7 @@ class StartDayTaskModal(discord.ui.Modal, title="Start productivity day"):
 
     task_list = discord.ui.TextInput(
         label="Today's tasks",
-        placeholder="Write one task per line. Self-care is added automatically.",
+        placeholder="Write one task per line.",
         style=discord.TextStyle.paragraph,
         min_length=1,
         max_length=1800,
@@ -997,7 +996,6 @@ class StartDayTaskModal(discord.ui.Modal, title="Start productivity day"):
             return
 
         task_names = [line.strip() for line in str(self.task_list).splitlines() if line.strip()]
-        task_names = [name for name in task_names if name.lower() != SELF_CARE_TASK.lower()]
         if not task_names:
             await interaction.response.send_message(
                 embed=make_embed("No Tasks Found", "Add at least one task and start again."),
@@ -1006,12 +1004,11 @@ class StartDayTaskModal(discord.ui.Modal, title="Start productivity day"):
             return
         if len(task_names) > MAX_CUSTOM_TASKS:
             await interaction.response.send_message(
-                embed=make_embed("Too Many Tasks", f"Enter up to **{MAX_CUSTOM_TASKS}** tasks plus Self-care."),
+                embed=make_embed("Too Many Tasks", f"Enter up to **{MAX_CUSTOM_TASKS}** tasks."),
                 ephemeral=True,
             )
             return
 
-        task_names.append(SELF_CARE_TASK)
         day_id, started_at = create_day(self.user.id, task_names)
         await interaction.response.send_message(
             embed=make_embed(
@@ -1556,9 +1553,6 @@ async def removetask(interaction: discord.Interaction, task: str):
     if not task_row:
         await interaction.response.send_message(embed=make_embed("Task Not Found", "That task is not on today's active task list."), ephemeral=True)
         return
-    if task_row["name"].lower() == SELF_CARE_TASK.lower():
-        await interaction.response.send_message(embed=make_embed("Cannot Remove Self-care", "Self-care stays on every day automatically."), ephemeral=True)
-        return
     if len(get_day_tasks(day["id"])) <= 1:
         await interaction.response.send_message(embed=make_embed("Cannot Remove Last Task", "Keep at least one task on the day."), ephemeral=True)
         return
@@ -1875,7 +1869,7 @@ async def test(interaction: discord.Interaction, option: app_commands.Choice[str
 
     if option.value == "startday":
         await interaction.response.send_message(
-            embed=make_embed("Startday Test", "`/startday` opens a multiline task form and appends Self-care."),
+            embed=make_embed("Startday Test", "`/startday` opens a multiline task form."),
             ephemeral=True,
         )
         return
