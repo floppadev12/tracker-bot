@@ -38,8 +38,16 @@ CHECKIN_INTERVAL = dt.timedelta(minutes=30)
 CHECKIN_RETRY_DELAYS = (60, 10, 10, 10)
 MAX_CUSTOM_TASKS = 25
 GOOGLE_DOC_USERS = {
-    334414804477411339: ("dooly", GOOGLE_DOCS_DOCUMENT_ID_DOOLY),
-    695348265289383967: ("koszan", GOOGLE_DOCS_DOCUMENT_ID_KOSZAN),
+    334414804477411339: {
+        "name": "dooly",
+        "document_id": GOOGLE_DOCS_DOCUMENT_ID_DOOLY,
+        "env_var": "GOOGLE_DOCS_DOCUMENT_ID_DOOLY",
+    },
+    695348265289383967: {
+        "name": "koszan",
+        "document_id": GOOGLE_DOCS_DOCUMENT_ID_KOSZAN,
+        "env_var": "GOOGLE_DOCS_DOCUMENT_ID_KOSZAN",
+    },
 }
 
 intents = discord.Intents.default()
@@ -735,15 +743,17 @@ def get_google_docs_service():
 
 
 def google_doc_user_config(discord_user_id: int | None):
-    name, document_id = GOOGLE_DOC_USERS.get(discord_user_id, (None, None))
-    return name, document_id or GOOGLE_DOCS_DOCUMENT_ID
+    config = GOOGLE_DOC_USERS.get(discord_user_id)
+    if config:
+        return config["name"], config["document_id"], config["env_var"]
+    return None, GOOGLE_DOCS_DOCUMENT_ID, "GOOGLE_DOCS_DOCUMENT_ID"
 
 
 def google_tab_title(day):
     work_date = day["work_date"]
     if isinstance(work_date, dt.datetime):
         work_date = work_date.date()
-    user_name, _ = google_doc_user_config(day.get("discord_user_id"))
+    user_name, _, _ = google_doc_user_config(day.get("discord_user_id"))
     suffix = f" {user_name}" if user_name else ""
     return f"{work_date.strftime('%d/%m/%Y')}{suffix}"
 
@@ -910,9 +920,12 @@ def sync_google_doc_day_blocking(day_id: int):
     day = db_one("SELECT * FROM work_days WHERE id = %s", (day_id,))
     if not day:
         return False
-    _, document_id = google_doc_user_config(day.get("discord_user_id"))
+    _, document_id, env_var = google_doc_user_config(day.get("discord_user_id"))
     if not document_id:
-        print(f"Google Docs sync skipped for day {day_id}: no document configured for user {day.get('discord_user_id')}.")
+        print(
+            f"Google Docs sync skipped for day {day_id}: {env_var} is not configured "
+            f"for user {day.get('discord_user_id')}."
+        )
         return False
 
     service = get_google_docs_service()
@@ -1019,15 +1032,17 @@ class StartDayTaskModal(discord.ui.Modal, title="Start productivity day"):
             )
             return
 
+        await interaction.response.defer()
         day_id, started_at = create_day(self.user.id, task_names)
-        await interaction.response.send_message(
-            embed=make_embed(
-                f"Welcome back, {self.user.display_name}",
-                f"👋 Day started with **{len(task_names)}** tasks.\nCheck your DMs to choose what you are starting with.",
-            )
-        )
-        asyncio.create_task(sync_google_doc_day(day_id))
         asyncio.create_task(run_checkin(self.user.id, "Choose what you are starting with.", started_at))
+        docs_synced = await sync_google_doc_day(day_id)
+        embed = make_embed(
+            f"Welcome back, {self.user.display_name}",
+            f"👋 Day started with **{len(task_names)}** tasks.\nCheck your DMs to choose what you are starting with.",
+        )
+        if google_docs_enabled() and not docs_synced:
+            embed.set_footer(text="Google Docs sync failed. Check the bot logs.")
+        await interaction.followup.send(embed=embed)
 
 
 class CloseDayRecapModal(discord.ui.Modal, title="End day recap"):
